@@ -28,7 +28,7 @@ def _client() -> Splitwise:
     oauth_token = os.getenv("SPLITWISE_OAUTH_TOKEN")
     oauth_token_secret = os.getenv("SPLITWISE_OAUTH_TOKEN_SECRET")
     if oauth_token and oauth_token_secret:
-        # SDK expects dict with oauth_token + oauth_token_secret. :contentReference[oaicite:8]{index=8}
+        # SDK expects dict with oauth_token + oauth_token_secret.
         s.setAccessToken({"oauth_token": oauth_token, "oauth_token_secret": oauth_token_secret})
 
     return s
@@ -58,7 +58,6 @@ def splitwise_friends() -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
     for f in friends:
         item = _user_to_dict(f)
-        # balances is a list of Balance objects; keep it simple
         balances = []
         for b in (getattr(f, "getBalances", lambda: [])() or []):
             balances.append({
@@ -93,7 +92,6 @@ def splitwise_expenses(
 ) -> List[Dict[str, Any]]:
     """
     Fetch expenses (lightweight projection).
-    Note: Splitwise SDK supports filters like group_id, dated_after, dated_before. :contentReference[oaicite:9]{index=9}
     """
     s = _client()
     expenses = s.getExpenses(
@@ -129,6 +127,10 @@ def splitwise_create_expense_equal_split(
     """
     if not participant_ids:
         raise ValueError("participant_ids must not be empty")
+    if cost <= 0:
+        raise ValueError("cost must be > 0")
+    if payer_id not in participant_ids:
+        raise ValueError("payer_id must be included in participant_ids")
 
     s = _client()
 
@@ -151,6 +153,79 @@ def splitwise_create_expense_equal_split(
         users.append(u)
 
     expense.setUsers(users)
+
+    created, errors = s.createExpense(expense)
+    if errors:
+        return {"ok": False, "errors": errors}
+
+    return {"ok": True, "expense_id": created.getId()}
+
+@mcp.tool()
+def splitwise_create_expense_unequal_split(
+    description: str,
+    cost: float,
+    users: List[Dict[str, Any]],
+    group_id: Optional[int] = None,
+    currency_code: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Create an expense with an unequal split.
+
+    `users` must be a list of dicts like:
+      {"id": 123, "paid_share": 10.0, "owed_share": 2.5}
+
+    Constraints:
+    - sum(paid_share) == cost (within 0.01)
+    - sum(owed_share) == cost (within 0.01)
+    """
+    if cost <= 0:
+        raise ValueError("cost must be > 0")
+    if not users:
+        raise ValueError("users must not be empty")
+
+    paid_total = 0.0
+    owed_total = 0.0
+
+    for u in users:
+        if "id" not in u:
+            raise ValueError("Each user entry must include 'id'")
+        # allow either snake_case or camelCase just in case
+        paid = float(u.get("paid_share", u.get("paidShare", 0.0)))
+        owed = float(u.get("owed_share", u.get("owedShare", 0.0)))
+        paid_total += paid
+        owed_total += owed
+
+    if abs(paid_total - cost) > 0.01 or abs(owed_total - cost) > 0.01:
+        return {
+            "ok": False,
+            "errors": [
+                f"Invalid shares: sum(paid_share)={paid_total:.2f}, sum(owed_share)={owed_total:.2f}, expected cost={cost:.2f}"
+            ],
+        }
+
+    s = _client()
+
+    expense = Expense()
+    expense.setDescription(description)
+    expense.setCost(f"{cost:.2f}")
+    if group_id is not None:
+        expense.setGroupId(group_id)
+    if currency_code:
+        expense.setCurrencyCode(currency_code)
+
+    eu_list: List[ExpenseUser] = []
+    for u in users:
+        uid = int(u["id"])
+        paid = float(u.get("paid_share", u.get("paidShare", 0.0)))
+        owed = float(u.get("owed_share", u.get("owedShare", 0.0)))
+
+        eu = ExpenseUser()
+        eu.setId(uid)
+        eu.setPaidShare(f"{paid:.2f}")
+        eu.setOwedShare(f"{owed:.2f}")
+        eu_list.append(eu)
+
+    expense.setUsers(eu_list)
 
     created, errors = s.createExpense(expense)
     if errors:
@@ -197,4 +272,4 @@ def splitwise_add_comment(expense_id: int, content: str) -> Dict[str, Any]:
 
 if __name__ == "__main__":
     # Stdio transport (most common local-dev setup)
-    mcp.run(transport="http", host='0.0.0.0', port=8000)
+    mcp.run(transport="http", host="0.0.0.0", port=8000)
