@@ -232,7 +232,56 @@ def splitwise_create_expense_unequal_split(
         return {"ok": False, "errors": errors}
 
     return {"ok": True, "expense_id": created.getId()}
+@mcp.tool()
+async def splitwise_create_expense_no_split(
+    description: str,
+    cost: float,
+    payer_id: int,
+    ower_id: int,
+    group_id: Optional[int] = None,
+    currency_code: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Create a 2-person expense with NO split:
+    - payer_id paid 100% of cost
+    - ower_id owes 100% of cost
 
+    This covers both cases:
+    - "I owe them"  -> payer_id = them, ower_id = me
+    - "They owe me" -> payer_id = me,   ower_id = them
+    """
+    if cost <= 0:
+        raise ValueError("cost must be > 0")
+    if payer_id == ower_id:
+        raise ValueError("payer_id and ower_id must be different")
+
+    s = _client()
+
+    expense = Expense()
+    expense.setDescription(description)
+    expense.setCost(f"{cost:.2f}")
+    if group_id is not None:
+        expense.setGroupId(group_id)
+    if currency_code:
+        expense.setCurrencyCode(currency_code)
+
+    payer = ExpenseUser()
+    payer.setId(payer_id)
+    payer.setPaidShare(f"{cost:.2f}")
+    payer.setOwedShare("0.00")
+
+    ower = ExpenseUser()
+    ower.setId(ower_id)
+    ower.setPaidShare("0.00")
+    ower.setOwedShare(f"{cost:.2f}")
+
+    expense.setUsers([payer, ower])
+
+    created, errors = await asyncio.to_thread(s.createExpense, expense)
+    if errors:
+        return {"ok": False, "errors": errors}
+    return {"ok": True, "expense_id": created.getId()}
+    
 @mcp.tool()
 def splitwise_update_expense(
     expense_id: int,
