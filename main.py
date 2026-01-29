@@ -17,7 +17,7 @@ MCP_SERVER_TOKEN = os.getenv("MCP_SERVER_TOKEN")
 if not MCP_SERVER_TOKEN:
     raise RuntimeError("Missing MCP_SERVER_TOKEN. Set a strong secret token in your environment variables.")
 
-mcp = FastMCP("Splitwise Personal MCP")
+mcp = FastMCP("Splitwise MCP")
 
 
 def _require_token(token: str) -> None:
