@@ -4,6 +4,14 @@ import asyncio
 from typing import Any, Dict, List, Optional
 
 from fastmcp import FastMCP
+from fastmcp.server.auth import require_auth
+from fastmcp.server.middleware import AuthMiddleware
+from fastmcp.server.dependencies import get_access_token
+
+# JWT verification provider (OAuth)
+# Depending on your FastMCP version, this may be located under:
+# fastmcp.server.auth.providers.jwt
+from fastmcp.server.auth.providers.jwt import JWKSVerifier
 
 from splitwise import Splitwise
 from splitwise.expense import Expense
@@ -11,61 +19,78 @@ from splitwise.user import ExpenseUser
 
 
 # -------------------------
-# Security: personal-use token gate
+# OAuth / JWT verification config
 # -------------------------
-MCP_SERVER_TOKEN = os.getenv("MCP_SERVER_TOKEN")
-if not MCP_SERVER_TOKEN:
-    raise RuntimeError("Missing MCP_SERVER_TOKEN. Set a strong secret token in your environment variables.")
+# Your OAuth provider's issuer (OIDC issuer URL)
+# Examples:
+# Auth0: https://YOUR_DOMAIN/
+# Clerk: https://clerk.YOUR_DOMAIN (varies)
+# Okta: https://YOUR_OKTA_DOMAIN/oauth2/default
+OAUTH_ISSUER = os.getenv("OAUTH_ISSUER")
+OAUTH_AUDIENCE = os.getenv("OAUTH_AUDIENCE")  # the API identifier / audience configured in your provider
 
-mcp = FastMCP("Splitwise MCP")
+# Optional personal restriction: allow only your subject (sub) or email
+ALLOWED_SUB = os.getenv("ALLOWED_SUB")        # e.g. "auth0|123..."
+ALLOWED_EMAIL = os.getenv("ALLOWED_EMAIL")    # e.g. "you@example.com"
+
+if not OAUTH_ISSUER or not OAUTH_AUDIENCE:
+    raise RuntimeError("Missing OAUTH_ISSUER / OAUTH_AUDIENCE env vars for OAuth validation.")
+
+auth = JWKSVerifier(
+    issuer=OAUTH_ISSUER,
+    audience=OAUTH_AUDIENCE,
+)
+
+mcp = FastMCP(
+    "Splitwise Personal MCP (OAuth)",
+    auth=auth,
+    middleware=[AuthMiddleware(auth=require_auth)],
+)
 
 
-def _require_token(token: str) -> None:
+def _assert_allowed_caller() -> None:
     """
-    Simple personal-use protection.
-    Every tool must receive token == MCP_SERVER_TOKEN.
+    Optional extra lock: even if someone gets a valid token from the same issuer,
+    only allow calls from your identity.
     """
-    if token != MCP_SERVER_TOKEN:
-        raise PermissionError("Unauthorized: invalid token.")
+    token = get_access_token()
+    if token is None:
+        raise PermissionError("Not authenticated")
+
+    claims = token.claims or {}
+    sub = claims.get("sub")
+    email = claims.get("email") or claims.get("preferred_username")
+
+    if ALLOWED_SUB and sub != ALLOWED_SUB:
+        raise PermissionError("Forbidden: caller not allowed (sub mismatch).")
+    if ALLOWED_EMAIL and email != ALLOWED_EMAIL:
+        raise PermissionError("Forbidden: caller not allowed (email mismatch).")
 
 
 # -------------------------
-# Splitwise client
+# Splitwise client (personal)
 # -------------------------
 SPLITWISE_CONSUMER_KEY = os.getenv("SPLITWISE_CONSUMER_KEY")
 SPLITWISE_CONSUMER_SECRET = os.getenv("SPLITWISE_CONSUMER_SECRET")
-
 if not SPLITWISE_CONSUMER_KEY or not SPLITWISE_CONSUMER_SECRET:
     raise RuntimeError("Missing SPLITWISE_CONSUMER_KEY / SPLITWISE_CONSUMER_SECRET env vars.")
 
 SPLITWISE_API_KEY = os.getenv("SPLITWISE_API_KEY")
-SPLITWISE_OAUTH_TOKEN_JSON = os.getenv("SPLITWISE_OAUTH_TOKEN_JSON")  # JSON dict if you prefer OAuth token storage
+SPLITWISE_OAUTH_TOKEN_JSON = os.getenv("SPLITWISE_OAUTH_TOKEN_JSON")  # optional
 
 
 def _client() -> Splitwise:
-    """
-    Personal-use Splitwise client.
-    Prefer API Key (simplest). Otherwise, use OAuth access token JSON if provided.
-    """
     if SPLITWISE_API_KEY:
         return Splitwise(SPLITWISE_CONSUMER_KEY, SPLITWISE_CONSUMER_SECRET, api_key=SPLITWISE_API_KEY)
 
     s = Splitwise(SPLITWISE_CONSUMER_KEY, SPLITWISE_CONSUMER_SECRET)
     if SPLITWISE_OAUTH_TOKEN_JSON:
-        try:
-            token_dict = json.loads(SPLITWISE_OAUTH_TOKEN_JSON)
-        except json.JSONDecodeError as e:
-            raise RuntimeError("SPLITWISE_OAUTH_TOKEN_JSON must be valid JSON.") from e
-        s.setAccessToken(token_dict)
-
+        s.setAccessToken(json.loads(SPLITWISE_OAUTH_TOKEN_JSON))
     return s
 
 
 def _balance_to_dict(b: Any) -> Dict[str, Any]:
-    return {
-        "currency": getattr(b, "getCurrencyCode", lambda: None)(),
-        "amount": getattr(b, "getAmount", lambda: None)(),
-    }
+    return {"currency": getattr(b, "getCurrencyCode", lambda: None)(), "amount": getattr(b, "getAmount", lambda: None)()}
 
 
 def _expense_to_dict(e: Any) -> Dict[str, Any]:
@@ -76,20 +101,18 @@ def _expense_to_dict(e: Any) -> Dict[str, Any]:
         "cost": e.getCost(),
         "currency_code": e.getCurrencyCode(),
         "date": e.getDate(),
-        "details": getattr(e, "getDetails", lambda: None)(),
         "created_at": getattr(e, "getCreatedAt", lambda: None)(),
         "updated_at": getattr(e, "getUpdatedAt", lambda: None)(),
     }
 
 
 # -------------------------
-# Tools (all async)
+# Tools
 # -------------------------
 
 @mcp.tool()
-async def splitwise_current_user(token: str) -> Dict[str, Any]:
-    """Return the authenticated Splitwise user's profile (personal account)."""
-    _require_token(token)
+async def splitwise_current_user() -> Dict[str, Any]:
+    _assert_allowed_caller()
     s = _client()
     u = await asyncio.to_thread(s.getCurrentUser)
     return {
@@ -103,18 +126,15 @@ async def splitwise_current_user(token: str) -> Dict[str, Any]:
 
 
 @mcp.tool()
-async def splitwise_friends(token: str) -> List[Dict[str, Any]]:
-    """List friends of the current user (personal account)."""
-    _require_token(token)
+async def splitwise_friends() -> List[Dict[str, Any]]:
+    _assert_allowed_caller()
     s = _client()
     friends = await asyncio.to_thread(s.getFriends)
-
     out: List[Dict[str, Any]] = []
     for f in friends:
         balances = []
         for b in (getattr(f, "getBalances", lambda: [])() or []):
             balances.append(_balance_to_dict(b))
-
         out.append(
             {
                 "id": f.getId(),
@@ -128,36 +148,23 @@ async def splitwise_friends(token: str) -> List[Dict[str, Any]]:
 
 
 @mcp.tool()
-async def splitwise_groups(token: str) -> List[Dict[str, Any]]:
-    """List groups for the current user."""
-    _require_token(token)
+async def splitwise_groups() -> List[Dict[str, Any]]:
+    _assert_allowed_caller()
     s = _client()
     groups = await asyncio.to_thread(s.getGroups)
-    return [
-        {
-            "id": g.getId(),
-            "name": g.getName(),
-            "simplified_by_default": getattr(g, "isSimplifiedByDefault", lambda: None)(),
-            "invite_link": getattr(g, "getInviteLink", lambda: None)(),
-        }
-        for g in groups
-    ]
+    return [{"id": g.getId(), "name": g.getName()} for g in groups]
 
 
 @mcp.tool()
 async def splitwise_expenses(
-    token: str,
     limit: int = 20,
     offset: int = 0,
     group_id: Optional[int] = None,
     friend_id: Optional[int] = None,
-    dated_after: Optional[str] = None,   # YYYY-MM-DD
-    dated_before: Optional[str] = None,  # YYYY-MM-DD
+    dated_after: Optional[str] = None,
+    dated_before: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
-    """
-    Fetch expenses with optional filters.
-    """
-    _require_token(token)
+    _assert_allowed_caller()
     s = _client()
 
     def _fetch():
@@ -176,7 +183,6 @@ async def splitwise_expenses(
 
 @mcp.tool()
 async def splitwise_create_expense_equal_split(
-    token: str,
     description: str,
     cost: float,
     payer_id: int,
@@ -184,10 +190,7 @@ async def splitwise_create_expense_equal_split(
     group_id: Optional[int] = None,
     currency_code: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """
-    Create an expense where participants split equally; payer pays 100% (by default).
-    """
-    _require_token(token)
+    _assert_allowed_caller()
     if cost <= 0:
         raise ValueError("cost must be > 0")
     if not participant_ids:
@@ -209,11 +212,11 @@ async def splitwise_create_expense_equal_split(
 
     users: List[ExpenseUser] = []
     for uid in participant_ids:
-        u = ExpenseUser()
-        u.setId(uid)
-        u.setOwedShare(f"{owed_each:.2f}")
-        u.setPaidShare(f"{cost:.2f}" if uid == payer_id else "0.00")
-        users.append(u)
+        eu = ExpenseUser()
+        eu.setId(uid)
+        eu.setOwedShare(f"{owed_each:.2f}")
+        eu.setPaidShare(f"{cost:.2f}" if uid == payer_id else "0.00")
+        users.append(eu)
 
     expense.setUsers(users)
 
@@ -225,39 +228,22 @@ async def splitwise_create_expense_equal_split(
 
 @mcp.tool()
 async def splitwise_create_expense_unequal_split(
-    token: str,
     description: str,
     cost: float,
     users: List[Dict[str, Any]],
     group_id: Optional[int] = None,
     currency_code: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """
-    Create an expense with an unequal split.
-    Provide `users` list as:
-    [
-      {"id": 123, "paid_share": 10.0, "owed_share": 2.5},
-      {"id": 456, "paid_share": 0.0,  "owed_share": 7.5}
-    ]
-
-    Must satisfy:
-    - sum(paid_share) == cost
-    - sum(owed_share) == cost
-    """
-    _require_token(token)
+    _assert_allowed_caller()
     if cost <= 0:
         raise ValueError("cost must be > 0")
     if not users:
         raise ValueError("users must not be empty")
 
-    # validate totals (tolerant)
     paid_total = sum(float(u.get("paid_share", 0)) for u in users)
     owed_total = sum(float(u.get("owed_share", 0)) for u in users)
 
-    def _close(a: float, b: float, eps: float = 0.01) -> bool:
-        return abs(a - b) <= eps
-
-    if not _close(paid_total, cost) or not _close(owed_total, cost):
+    if abs(paid_total - cost) > 0.01 or abs(owed_total - cost) > 0.01:
         return {
             "ok": False,
             "errors": [
@@ -299,22 +285,18 @@ async def splitwise_create_expense_unequal_split(
 
 @mcp.tool()
 async def splitwise_update_expense(
-    token: str,
     expense_id: int,
     description: Optional[str] = None,
     cost: Optional[float] = None,
 ) -> Dict[str, Any]:
-    """
-    Update an expense (description and/or cost).
-    """
-    _require_token(token)
+    _assert_allowed_caller()
     if description is None and cost is None:
         raise ValueError("Provide at least one field to update (description or cost).")
 
     s = _client()
-
     expense = Expense()
     expense.id = int(expense_id)
+
     if description is not None:
         expense.setDescription(description)
     if cost is not None:
@@ -325,23 +307,20 @@ async def splitwise_update_expense(
     updated, errors = await asyncio.to_thread(s.updateExpense, expense)
     if errors:
         return {"ok": False, "errors": errors}
-
     return {"ok": True, "expense_id": updated.getId()}
 
 
 @mcp.tool()
-async def splitwise_delete_expense(token: str, expense_id: int) -> Dict[str, Any]:
-    """Delete an expense."""
-    _require_token(token)
+async def splitwise_delete_expense(expense_id: int) -> Dict[str, Any]:
+    _assert_allowed_caller()
     s = _client()
     success, errors = await asyncio.to_thread(s.deleteExpense, int(expense_id))
     return {"ok": bool(success), "errors": errors}
 
 
 @mcp.tool()
-async def splitwise_add_comment(token: str, expense_id: int, content: str) -> Dict[str, Any]:
-    """Add a comment to an expense."""
-    _require_token(token)
+async def splitwise_add_comment(expense_id: int, content: str) -> Dict[str, Any]:
+    _assert_allowed_caller()
     if not content.strip():
         raise ValueError("content must not be empty")
 
@@ -349,7 +328,6 @@ async def splitwise_add_comment(token: str, expense_id: int, content: str) -> Di
     comment, errors = await asyncio.to_thread(s.createComment, int(expense_id), content)
     if errors:
         return {"ok": False, "errors": errors}
-
     return {"ok": True, "comment_id": comment.getId(), "content": comment.getContent()}
 
 
