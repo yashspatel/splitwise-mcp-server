@@ -1,67 +1,70 @@
 """
-main.py — Splitwise MCP Server (Async, with a Create-Expense Router)
+main.py — Splitwise MCP Server (Async) with a Reliable Create-Expense Router
 
-Goal
-----
-Make Splitwise actions available as MCP tools, and make "create expense" reliable:
-- Users can say: "Honey owes me 10 CAD" -> NO SPLIT (100% owed by Honey)
-- Users can say: "Add 174 CAD in Trip group, I paid, split equally with Rutik" -> EQUAL SPLIT
-- Users can specify UNEQUAL SPLITS with explicit shares
+Problem you hit
+---------------
+ChatGPT sometimes *chooses the wrong tool* (e.g., equal split) and even claims
+"the tool only supports equal splits" when it didn't reliably pick/see the
+unequal/no-split tools.
 
-Why a router?
--------------
-LLM clients sometimes pick the wrong tool (e.g., always calling equal split).
-So we provide ONE preferred tool: splitwise_create_expense_router(...)
-It resolves:
-- group by name
-- members by name
-- current user id ("me")
-- and routes internally to the correct create method
+Fix in this file
+----------------
+1) Expose ONE preferred create tool: splitwise_create_expense(...)
+   - It can do:
+     - equal split
+     - no split (100% owed by one person)
+     - unequal split by explicit shares
+     - unequal split by percentages (e.g., "my share is 35%")
+2) Do NOT expose separate create tools (equal/no_split/unequal) as MCP tools.
+   - They remain as internal functions.
+   - This prevents ChatGPT from mistakenly calling the equal-split tool.
+3) Keep other tools: current_user, friends, groups, expenses, update, delete, add_comment
+
+Notes
+-----
+- Splitwise Python SDK is synchronous, so we wrap calls with asyncio.to_thread(...)
+- For percentage split: we create ONE expense using unequal shares (no “jugaad”).
 """
 
-import os  # Environment variables
-import asyncio  # Run blocking SDK calls in threads
-from typing import Any, Dict, List, Optional, Tuple  # Type hints
+import os
+import asyncio
+from typing import Any, Dict, List, Optional, Tuple
 
-from dotenv import load_dotenv  # Local dev env loading
-from fastmcp import FastMCP  # MCP server framework
+from dotenv import load_dotenv
+from fastmcp import FastMCP
 
-from splitwise import Splitwise  # Splitwise SDK client
-from splitwise.expense import Expense  # Splitwise Expense model
-from splitwise.user import ExpenseUser  # Splitwise ExpenseUser model
+from splitwise import Splitwise
+from splitwise.expense import Expense
+from splitwise.user import ExpenseUser
 
-# Load local .env if present (safe in cloud; does nothing if missing)
 load_dotenv()
-
-# Create MCP server
 mcp = FastMCP("Splitwise MCP")
 
 
 # =============================================================================
-# Splitwise client construction
+# Splitwise client
 # =============================================================================
 
 def _client() -> Splitwise:
     """
-    Create and return a configured Splitwise client.
-    Auth strategy:
-      - Prefer API key mode (single-user automation)
-      - Otherwise use OAuth1 token+secret if provided
+    Build a Splitwise client from environment variables.
+
+    Required:
+      - SPLITWISE_CONSUMER_KEY
+      - SPLITWISE_CONSUMER_SECRET
+
+    Optional (personal single-user):
+      - SPLITWISE_API_KEY
+      - SPLITWISE_OAUTH_TOKEN + SPLITWISE_OAUTH_TOKEN_SECRET
     """
-    consumer_key = os.environ["SPLITWISE_CONSUMER_KEY"]  # Splitwise app key
-    consumer_secret = os.environ["SPLITWISE_CONSUMER_SECRET"]  # Splitwise app secret
+    consumer_key = os.environ["SPLITWISE_CONSUMER_KEY"]
+    consumer_secret = os.environ["SPLITWISE_CONSUMER_SECRET"]
 
-    api_key = os.getenv("SPLITWISE_API_KEY")  # Optional: API key mode
-    s = (
-        Splitwise(consumer_key, consumer_secret, api_key=api_key)
-        if api_key
-        else Splitwise(consumer_key, consumer_secret)
-    )
+    api_key = os.getenv("SPLITWISE_API_KEY")
+    s = Splitwise(consumer_key, consumer_secret, api_key=api_key) if api_key else Splitwise(consumer_key, consumer_secret)
 
-    oauth_token = os.getenv("SPLITWISE_OAUTH_TOKEN")  # Optional OAuth token
-    oauth_token_secret = os.getenv("SPLITWISE_OAUTH_TOKEN_SECRET")  # Optional OAuth secret
-
-    # If OAuth creds exist, attach them so requests are performed as that user
+    oauth_token = os.getenv("SPLITWISE_OAUTH_TOKEN")
+    oauth_token_secret = os.getenv("SPLITWISE_OAUTH_TOKEN_SECRET")
     if oauth_token and oauth_token_secret:
         s.setAccessToken({"oauth_token": oauth_token, "oauth_token_secret": oauth_token_secret})
 
@@ -69,21 +72,16 @@ def _client() -> Splitwise:
 
 
 # =============================================================================
-# Simple normalization + lookup helpers (name -> id)
+# Name normalization + ID resolution helpers
 # =============================================================================
 
 def _norm(s: str) -> str:
-    """Normalize strings for robust comparisons (case/extra spaces)."""
+    """Normalize a name for matching (lowercase, collapse spaces)."""
     return " ".join((s or "").strip().lower().split())
 
 
-def _full_name(first: str, last: str) -> str:
-    """Build 'first last' normalized name string."""
-    return _norm(f"{first} {last}".strip())
-
-
 def _user_to_dict(u: Any) -> Dict[str, Any]:
-    """Convert a Splitwise user-like object to a JSON-friendly dict."""
+    """Convert Splitwise user-like objects to JSON-friendly dict."""
     return {
         "id": getattr(u, "getId", lambda: None)(),
         "first_name": getattr(u, "getFirstName", lambda: None)(),
@@ -94,12 +92,9 @@ def _user_to_dict(u: Any) -> Dict[str, Any]:
 
 def _find_user_id_by_name(users: List[Any], name: str) -> Optional[int]:
     """
-    Find a user id by matching first name OR full name.
-    Works for friends list or group members list.
-
-    Examples:
-      name="honey" matches first_name "Honey"
-      name="honey patel" matches full name "Honey Patel"
+    Match by first name or full name.
+    Example: "honey" matches first_name="Honey"
+             "honey patel" matches full name.
     """
     target = _norm(name)
     if not target:
@@ -108,7 +103,7 @@ def _find_user_id_by_name(users: List[Any], name: str) -> Optional[int]:
     for u in users:
         first = _norm(getattr(u, "getFirstName", lambda: "")() or "")
         last = _norm(getattr(u, "getLastName", lambda: "")() or "")
-        full = _full_name(first, last)
+        full = _norm(f"{first} {last}".strip())
 
         if target == first or target == full:
             return getattr(u, "getId", lambda: None)()
@@ -117,25 +112,20 @@ def _find_user_id_by_name(users: List[Any], name: str) -> Optional[int]:
 
 
 def _find_group_by_name(groups: List[Any], group_name: str) -> Optional[Any]:
-    """
-    Find a Splitwise Group object by name (case-insensitive).
-    """
+    """Find a group by name (case-insensitive)."""
     target = _norm(group_name)
     if not target:
         return None
 
     for g in groups:
-        name = _norm(getattr(g, "getName", lambda: "")() or "")
-        if name == target:
+        if _norm(getattr(g, "getName", lambda: "")() or "") == target:
             return g
 
     return None
 
 
 async def _get_me_friends_groups(s: Splitwise) -> Tuple[Any, List[Any], List[Any]]:
-    """
-    Fetch current user + friends + groups (async wrapper).
-    """
+    """Fetch current user, friends, and groups."""
     me = await asyncio.to_thread(s.getCurrentUser)
     friends = await asyncio.to_thread(s.getFriends)
     groups = await asyncio.to_thread(s.getGroups)
@@ -143,12 +133,156 @@ async def _get_me_friends_groups(s: Splitwise) -> Tuple[Any, List[Any], List[Any
 
 
 async def _get_group_members(s: Splitwise, group_id: int) -> List[Any]:
+    """Fetch group details and return members list."""
+    g = await asyncio.to_thread(s.getGroup, int(group_id))
+    return getattr(g, "getMembers", lambda: [])() or []
+
+
+# =============================================================================
+# Internal create-expense builders (NOT exposed as MCP tools)
+# =============================================================================
+
+async def _create_expense_equal_split(
+    s: Splitwise,
+    description: str,
+    cost: float,
+    payer_id: int,
+    participant_ids: List[int],
+    group_id: Optional[int],
+    currency_code: Optional[str],
+) -> Dict[str, Any]:
+    """Create equal split expense (internal)."""
+    if cost <= 0:
+        raise ValueError("cost must be > 0")
+    if not participant_ids:
+        raise ValueError("participant_ids must not be empty")
+    if payer_id not in participant_ids:
+        raise ValueError("payer_id must be included in participant_ids")
+
+    expense = Expense()
+    expense.setDescription(description)
+    expense.setCost(f"{cost:.2f}")
+    if group_id is not None:
+        expense.setGroupId(int(group_id))
+    if currency_code:
+        expense.setCurrencyCode(currency_code)
+
+    owed_each = cost / len(participant_ids)
+
+    users: List[ExpenseUser] = []
+    for uid in participant_ids:
+        eu = ExpenseUser()
+        eu.setId(int(uid))
+        eu.setOwedShare(f"{owed_each:.2f}")
+        eu.setPaidShare(f"{cost:.2f}" if int(uid) == int(payer_id) else "0.00")
+        users.append(eu)
+
+    expense.setUsers(users)
+
+    created, errors = await asyncio.to_thread(s.createExpense, expense)
+    if errors:
+        return {"ok": False, "errors": errors}
+    return {"ok": True, "expense_id": created.getId(), "split_type_used": "equal"}
+
+
+async def _create_expense_no_split(
+    s: Splitwise,
+    description: str,
+    cost: float,
+    payer_id: int,
+    ower_id: int,
+    group_id: Optional[int],
+    currency_code: Optional[str],
+) -> Dict[str, Any]:
+    """Create a 2-person expense where one person owes 100% (internal)."""
+    if cost <= 0:
+        raise ValueError("cost must be > 0")
+    if int(payer_id) == int(ower_id):
+        raise ValueError("payer_id and ower_id must be different")
+
+    expense = Expense()
+    expense.setDescription(description)
+    expense.setCost(f"{cost:.2f}")
+    if group_id is not None:
+        expense.setGroupId(int(group_id))
+    if currency_code:
+        expense.setCurrencyCode(currency_code)
+
+    payer = ExpenseUser()
+    payer.setId(int(payer_id))
+    payer.setPaidShare(f"{cost:.2f}")
+    payer.setOwedShare("0.00")
+
+    ower = ExpenseUser()
+    ower.setId(int(ower_id))
+    ower.setPaidShare("0.00")
+    ower.setOwedShare(f"{cost:.2f}")
+
+    expense.setUsers([payer, ower])
+
+    created, errors = await asyncio.to_thread(s.createExpense, expense)
+    if errors:
+        return {"ok": False, "errors": errors}
+    return {"ok": True, "expense_id": created.getId(), "split_type_used": "no_split"}
+
+
+async def _create_expense_unequal_split_by_ids(
+    s: Splitwise,
+    description: str,
+    cost: float,
+    users: List[Dict[str, Any]],
+    group_id: Optional[int],
+    currency_code: Optional[str],
+) -> Dict[str, Any]:
     """
-    Fetch group details (including members) and return member list.
+    Create an expense with unequal split (internal).
+    users = [{"id": 1, "paid_share": 10, "owed_share": 2}, ...]
     """
-    group = await asyncio.to_thread(s.getGroup, group_id)
-    members = getattr(group, "getMembers", lambda: [])() or []
-    return members
+    if cost <= 0:
+        raise ValueError("cost must be > 0")
+    if not users:
+        raise ValueError("users must not be empty")
+
+    paid_total = sum(float(u.get("paid_share", 0.0)) for u in users)
+    owed_total = sum(float(u.get("owed_share", 0.0)) for u in users)
+
+    # Tolerance for rounding issues
+    if abs(paid_total - cost) > 0.01 or abs(owed_total - cost) > 0.01:
+        return {
+            "ok": False,
+            "errors": [
+                f"Invalid shares: paid_total={paid_total:.2f}, owed_total={owed_total:.2f}, expected cost={cost:.2f}"
+            ],
+        }
+
+    expense = Expense()
+    expense.setDescription(description)
+    expense.setCost(f"{cost:.2f}")
+    if group_id is not None:
+        expense.setGroupId(int(group_id))
+    if currency_code:
+        expense.setCurrencyCode(currency_code)
+
+    eu_list: List[ExpenseUser] = []
+    for u in users:
+        if "id" not in u:
+            raise ValueError("Each users entry must include 'id'")
+        uid = int(u["id"])
+        paid = float(u.get("paid_share", 0.0))
+        owed = float(u.get("owed_share", 0.0))
+
+        eu = ExpenseUser()
+        eu.setId(uid)
+        eu.setPaidShare(f"{paid:.2f}")
+        eu.setOwedShare(f"{owed:.2f}")
+        eu_list.append(eu)
+
+    expense.setUsers(eu_list)
+
+    created, errors = await asyncio.to_thread(s.createExpense, expense)
+    if errors:
+        return {"ok": False, "errors": errors}
+    return {"ok": True, "expense_id": created.getId(), "split_type_used": "unequal"}
 
 
 # =============================================================================
@@ -191,14 +325,7 @@ async def splitwise_groups() -> List[Dict[str, Any]]:
     """List groups."""
     s = _client()
     groups = await asyncio.to_thread(s.getGroups)
-    return [
-        {
-            "id": g.getId(),
-            "name": g.getName(),
-            "simplified_by_default": getattr(g, "isSimplifiedByDefault", lambda: None)(),
-        }
-        for g in groups
-    ]
+    return [{"id": g.getId(), "name": g.getName()} for g in groups]
 
 
 @mcp.tool()
@@ -206,8 +333,8 @@ async def splitwise_expenses(
     limit: int = 20,
     offset: int = 0,
     group_id: Optional[int] = None,
-    dated_after: Optional[str] = None,   # "YYYY-MM-DD"
-    dated_before: Optional[str] = None,  # "YYYY-MM-DD"
+    dated_after: Optional[str] = None,
+    dated_before: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """Fetch expenses (lightweight projection)."""
     s = _client()
@@ -222,181 +349,22 @@ async def splitwise_expenses(
         )
 
     expenses = await asyncio.to_thread(_fetch)
-
-    out: List[Dict[str, Any]] = []
-    for e in expenses:
-        out.append(
-            {
-                "id": e.getId(),
-                "group_id": e.getGroupId(),
-                "description": e.getDescription(),
-                "cost": e.getCost(),
-                "currency_code": e.getCurrencyCode(),
-                "date": e.getDate(),
-            }
-        )
-    return out
-
-
-# =============================================================================
-# CORE WRITE TOOLS (still exposed, but router is preferred)
-# =============================================================================
-
-@mcp.tool()
-async def splitwise_create_expense_equal_split(
-    description: str,
-    cost: float,
-    payer_id: int,
-    participant_ids: List[int],
-    group_id: Optional[int] = None,
-    currency_code: Optional[str] = None,
-) -> Dict[str, Any]:
-    """
-    Create an expense split equally.
-    Note: Prefer splitwise_create_expense_router for natural-language flows.
-    """
-    if not participant_ids:
-        raise ValueError("participant_ids must not be empty")
-    if cost <= 0:
-        raise ValueError("cost must be > 0")
-    if payer_id not in participant_ids:
-        raise ValueError("payer_id must be included in participant_ids")
-
-    s = _client()
-
-    expense = Expense()
-    expense.setDescription(description)
-    expense.setCost(f"{cost:.2f}")
-    if group_id is not None:
-        expense.setGroupId(group_id)
-    if currency_code:
-        expense.setCurrencyCode(currency_code)
-
-    owed_each = cost / len(participant_ids)
-
-    users: List[ExpenseUser] = []
-    for uid in participant_ids:
-        u = ExpenseUser()
-        u.setId(uid)
-        u.setOwedShare(f"{owed_each:.2f}")
-        u.setPaidShare(f"{cost:.2f}" if uid == payer_id else "0.00")
-        users.append(u)
-
-    expense.setUsers(users)
-
-    created, errors = await asyncio.to_thread(s.createExpense, expense)
-    if errors:
-        return {"ok": False, "errors": errors}
-
-    return {"ok": True, "expense_id": created.getId()}
-
-
-@mcp.tool()
-async def splitwise_create_expense_unequal_split(
-    description: str,
-    cost: float,
-    users: List[Dict[str, Any]],
-    group_id: Optional[int] = None,
-    currency_code: Optional[str] = None,
-) -> Dict[str, Any]:
-    """
-    Create an expense with an unequal split.
-    users = [{"id": 1, "paid_share": 10, "owed_share": 2}, ...]
-    """
-    if cost <= 0:
-        raise ValueError("cost must be > 0")
-    if not users:
-        raise ValueError("users must not be empty")
-
-    paid_total = sum(float(u.get("paid_share", u.get("paidShare", 0.0))) for u in users)
-    owed_total = sum(float(u.get("owed_share", u.get("owedShare", 0.0))) for u in users)
-
-    if abs(paid_total - cost) > 0.01 or abs(owed_total - cost) > 0.01:
-        return {
-            "ok": False,
-            "errors": [
-                f"Invalid shares: sum(paid_share)={paid_total:.2f}, sum(owed_share)={owed_total:.2f}, expected cost={cost:.2f}"
-            ],
+    return [
+        {
+            "id": e.getId(),
+            "group_id": e.getGroupId(),
+            "description": e.getDescription(),
+            "cost": e.getCost(),
+            "currency_code": e.getCurrencyCode(),
+            "date": e.getDate(),
         }
-
-    s = _client()
-
-    expense = Expense()
-    expense.setDescription(description)
-    expense.setCost(f"{cost:.2f}")
-    if group_id is not None:
-        expense.setGroupId(group_id)
-    if currency_code:
-        expense.setCurrencyCode(currency_code)
-
-    eu_list: List[ExpenseUser] = []
-    for u in users:
-        if "id" not in u:
-            raise ValueError("Each user entry must include 'id'")
-        uid = int(u["id"])
-        paid = float(u.get("paid_share", u.get("paidShare", 0.0)))
-        owed = float(u.get("owed_share", u.get("owedShare", 0.0)))
-
-        eu = ExpenseUser()
-        eu.setId(uid)
-        eu.setPaidShare(f"{paid:.2f}")
-        eu.setOwedShare(f"{owed:.2f}")
-        eu_list.append(eu)
-
-    expense.setUsers(eu_list)
-
-    created, errors = await asyncio.to_thread(s.createExpense, expense)
-    if errors:
-        return {"ok": False, "errors": errors}
-
-    return {"ok": True, "expense_id": created.getId()}
+        for e in expenses
+    ]
 
 
-@mcp.tool()
-async def splitwise_create_expense_no_split(
-    description: str,
-    cost: float,
-    payer_id: int,
-    ower_id: int,
-    group_id: Optional[int] = None,
-    currency_code: Optional[str] = None,
-) -> Dict[str, Any]:
-    """
-    Create a 2-person expense where one person owes 100% (no split).
-    """
-    if cost <= 0:
-        raise ValueError("cost must be > 0")
-    if payer_id == ower_id:
-        raise ValueError("payer_id and ower_id must be different")
-
-    s = _client()
-
-    expense = Expense()
-    expense.setDescription(description)
-    expense.setCost(f"{cost:.2f}")
-    if group_id is not None:
-        expense.setGroupId(group_id)
-    if currency_code:
-        expense.setCurrencyCode(currency_code)
-
-    payer = ExpenseUser()
-    payer.setId(int(payer_id))
-    payer.setPaidShare(f"{cost:.2f}")
-    payer.setOwedShare("0.00")
-
-    ower = ExpenseUser()
-    ower.setId(int(ower_id))
-    ower.setPaidShare("0.00")
-    ower.setOwedShare(f"{cost:.2f}")
-
-    expense.setUsers([payer, ower])
-
-    created, errors = await asyncio.to_thread(s.createExpense, expense)
-    if errors:
-        return {"ok": False, "errors": errors}
-
-    return {"ok": True, "expense_id": created.getId()}
-
+# =============================================================================
+# WRITE TOOLS (update/delete/comment)
+# =============================================================================
 
 @mcp.tool()
 async def splitwise_update_expense(
@@ -404,7 +372,7 @@ async def splitwise_update_expense(
     description: Optional[str] = None,
     cost: Optional[float] = None,
 ) -> Dict[str, Any]:
-    """Update an existing expense."""
+    """Update an existing expense (description and/or cost)."""
     s = _client()
 
     e = Expense()
@@ -412,7 +380,7 @@ async def splitwise_update_expense(
     if description is not None:
         e.setDescription(description)
     if cost is not None:
-        e.setCost(f"{cost:.2f}")
+        e.setCost(f"{float(cost):.2f}")
 
     updated, errors = await asyncio.to_thread(s.updateExpense, e)
     if errors:
@@ -439,61 +407,59 @@ async def splitwise_add_comment(expense_id: int, content: str) -> Dict[str, Any]
 
 
 # =============================================================================
-# ROUTER TOOL (preferred for "natural language" create expense)
+# ROUTER CREATE TOOL (the only "create expense" tool exposed)
 # =============================================================================
 
 @mcp.tool()
-async def splitwise_create_expense_router(
-    # High-level intent
+async def splitwise_create_expense(
     split_type: str,
     description: str,
     cost: float,
+    currency_code: Optional[str] = None,
 
-    # Optional group routing
+    # Group resolution (provide either)
     group_id: Optional[int] = None,
     group_name: Optional[str] = None,
 
-    # Optional currency
-    currency_code: Optional[str] = None,
+    # EQUAL split inputs (names)
+    paid_by: Optional[str] = None,                 # e.g. "me" or "Rutik"
+    participants: Optional[List[str]] = None,      # e.g. ["me", "Rutik", "Honey"]
 
-    # EQUAL SPLIT inputs (name-based recommended)
-    paid_by: Optional[str] = None,               # e.g. "me" or "Yash" or "Rutik"
-    participants: Optional[List[str]] = None,    # e.g. ["me", "Rutik"]
+    # NO SPLIT inputs (names)
+    counterparty: Optional[str] = None,            # e.g. "Honey"
+    direction: Optional[str] = None,               # "they_owe_me" or "i_owe_them"
 
-    # NO SPLIT inputs
-    counterparty: Optional[str] = None,          # e.g. "Honey"
-    direction: Optional[str] = None,             # "they_owe_me" or "i_owe_them"
-
-    # UNEQUAL SPLIT inputs (name-based)
+    # UNEQUAL split inputs (explicit shares by name)
     # Example:
-    # shares = [
-    #   {"name":"me", "paid_share": 10, "owed_share": 2},
-    #   {"name":"Rutik", "paid_share": 0, "owed_share": 8},
-    # ]
+    # shares = [{"name":"me","paid_share":100,"owed_share":35},{"name":"Hisaab","paid_share":0,"owed_share":65}]
     shares: Optional[List[Dict[str, Any]]] = None,
+
+    # UNEQUAL split by percentages (simple & common):
+    # Example: I paid total 100, my share 35%, Hisaab share 65%
+    # percent_split = [{"name":"me","owed_percent":35},{"name":"Hisaab","owed_percent":65}]
+    percent_split: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     """
-    PREFERRED entrypoint for creating expenses. This is the "router".
+    Create a Splitwise expense in ONE entry (no workaround).
 
     split_type:
-      - "equal": split equally among participants
-      - "no_split": one person owes 100% (direction + counterparty)
-      - "unequal": custom shares (shares list)
+      - "equal"     : equal split among participants
+      - "no_split"  : one person owes 100% (direction + counterparty)
+      - "unequal"   : custom split
+          - either provide `shares` with paid_share/owed_share
+          - OR provide `percent_split` with owed_percent values summing to 100
 
-    group:
-      Provide either group_id OR group_name.
-      If provided, this router will resolve group members by name.
+    Names:
+      Use "me" to refer to your current Splitwise user.
 
-    names:
-      Use "me" to refer to the current user.
+    Group:
+      Provide group_id OR group_name. If provided, member name resolution uses group members first.
     """
-    # Basic validation
-    if cost <= 0:
+    if float(cost) <= 0:
         raise ValueError("cost must be > 0")
 
-    split_type = _norm(split_type)
+    split_type_n = _norm(split_type)
 
-    # Create Splitwise client and preload common data for lookups
     s = _client()
     me, friends, groups = await _get_me_friends_groups(s)
 
@@ -502,32 +468,31 @@ async def splitwise_create_expense_router(
         raise ValueError("Could not determine current user id.")
 
     # Resolve group_id from group_name if needed
-    resolved_group_id: Optional[int] = group_id
+    resolved_group_id = group_id
     if resolved_group_id is None and group_name:
         g = _find_group_by_name(groups, group_name)
         if not g:
-            # Provide a helpful error with available group names
             available = [getattr(x, "getName", lambda: "")() for x in groups]
             return {"ok": False, "errors": [f"Group not found: {group_name}", "Available groups: " + ", ".join(available)]}
         resolved_group_id = getattr(g, "getId", lambda: None)()
 
-    # Resolve members list (friends + (optional) group members)
-    # If group provided, group members are the most accurate set for name resolution.
-    members: List[Any] = friends
+    # Choose the best list for name -> id resolution
+    members = friends
     if resolved_group_id is not None:
         members = await _get_group_members(s, int(resolved_group_id))
 
-    # Small helper: map a name to an id, with special handling for "me"
+    # Resolve a name to an id, supporting "me"
     def resolve_id(name: str) -> Optional[int]:
-        n = _norm(name)
-        if n in ("me", "myself", "i"):
+        nn = _norm(name)
+        if nn in ("me", "myself", "i"):
             return int(my_id)
+        # Prefer group members; fallback to friends
         return _find_user_id_by_name(members, name) or _find_user_id_by_name(friends, name)
 
-    # -------------------------------------------------------------------------
-    # NO SPLIT: "Honey owes me full" or "I owe Honey full"
-    # -------------------------------------------------------------------------
-    if split_type in ("no_split", "nosplit", "full"):
+    # -----------------------
+    # NO SPLIT (100% owed)
+    # -----------------------
+    if split_type_n in ("no_split", "nosplit", "full"):
         if not counterparty:
             raise ValueError("counterparty is required for split_type='no_split'")
         if direction not in ("they_owe_me", "i_owe_them"):
@@ -537,7 +502,6 @@ async def splitwise_create_expense_router(
         if not other_id:
             return {"ok": False, "errors": [f"Could not find user by name: {counterparty}"]}
 
-        # Determine payer/ower
         if direction == "they_owe_me":
             payer_id = int(my_id)
             ower_id = int(other_id)
@@ -545,42 +509,40 @@ async def splitwise_create_expense_router(
             payer_id = int(other_id)
             ower_id = int(my_id)
 
-        # Route to the existing no-split tool
-        return await splitwise_create_expense_no_split(
+        return await _create_expense_no_split(
+            s=s,
             description=description,
-            cost=cost,
+            cost=float(cost),
             payer_id=payer_id,
             ower_id=ower_id,
             group_id=resolved_group_id,
             currency_code=currency_code,
         )
 
-    # -------------------------------------------------------------------------
-    # EQUAL SPLIT: "I paid, split equally in group with X and Y"
-    # -------------------------------------------------------------------------
-    if split_type in ("equal", "equal_split", "split_equally"):
+    # -----------------------
+    # EQUAL SPLIT
+    # -----------------------
+    if split_type_n in ("equal", "equal_split", "split_equally"):
         if not paid_by:
             raise ValueError("paid_by is required for split_type='equal'")
-        if not participants or len(participants) == 0:
+        if not participants:
             raise ValueError("participants is required for split_type='equal'")
 
         payer_id = resolve_id(paid_by)
         if not payer_id:
-            return {"ok": False, "errors": [f"Could not resolve payer name: {paid_by}"]}
+            return {"ok": False, "errors": [f"Could not resolve paid_by name: {paid_by}"]}
 
         participant_ids: List[int] = []
         unresolved: List[str] = []
-
         for p in participants:
             pid = resolve_id(p)
-            if pid:
-            # ensure ints
-                participant_ids.append(int(pid))
-            else:
+            if pid is None:
                 unresolved.append(p)
+            else:
+                participant_ids.append(int(pid))
 
         if unresolved:
-            # Give user a helpful error and list of group members (if group provided)
+            # helpful: list known group members
             if resolved_group_id is not None:
                 names = [
                     f"{getattr(m, 'getFirstName', lambda: '')() or ''} {getattr(m, 'getLastName', lambda: '')() or ''}".strip()
@@ -595,74 +557,142 @@ async def splitwise_create_expense_router(
                 }
             return {"ok": False, "errors": ["Could not resolve these participant names: " + ", ".join(unresolved)]}
 
-        # Ensure payer is included (Splitwise tool expects that)
+        # Ensure payer included
         if int(payer_id) not in participant_ids:
             participant_ids.append(int(payer_id))
 
-        # Route to existing equal-split tool
-        return await splitwise_create_expense_equal_split(
+        return await _create_expense_equal_split(
+            s=s,
             description=description,
-            cost=cost,
+            cost=float(cost),
             payer_id=int(payer_id),
             participant_ids=participant_ids,
             group_id=resolved_group_id,
             currency_code=currency_code,
         )
 
-    # -------------------------------------------------------------------------
-    # UNEQUAL SPLIT: provide shares by name
-    # -------------------------------------------------------------------------
-    if split_type in ("unequal", "unequal_split", "custom"):
-        if not shares or len(shares) == 0:
-            raise ValueError("shares is required for split_type='unequal'")
+    # -----------------------
+    # UNEQUAL SPLIT
+    # -----------------------
+    if split_type_n in ("unequal", "unequal_split", "custom"):
+        # Case A: percent-based (common: "my share is 35%")
+        if percent_split and len(percent_split) > 0:
+            if not paid_by:
+                raise ValueError("paid_by is required for percent_split (who paid the full amount)")
 
-        # Convert share entries from names -> ids
-        users_payload: List[Dict[str, Any]] = []
-        unresolved: List[str] = []
+            payer_id = resolve_id(paid_by)
+            if not payer_id:
+                return {"ok": False, "errors": [f"Could not resolve paid_by name: {paid_by}"]}
 
-        for sh in shares:
-            name = sh.get("name")
-            if not name:
-                raise ValueError("Each shares entry must include 'name'")
-            uid = resolve_id(str(name))
-            if not uid:
-                unresolved.append(str(name))
-                continue
+            # Resolve all users + validate percent totals
+            resolved: List[Tuple[int, float]] = []
+            unresolved: List[str] = []
+            pct_total = 0.0
 
-            users_payload.append(
-                {
-                    "id": int(uid),
-                    "paid_share": float(sh.get("paid_share", sh.get("paidShare", 0.0))),
-                    "owed_share": float(sh.get("owed_share", sh.get("owedShare", 0.0))),
-                }
+            for item in percent_split:
+                nm = item.get("name")
+                if not nm:
+                    raise ValueError("Each percent_split entry must include 'name'")
+                pct = float(item.get("owed_percent", item.get("percent", 0.0)))
+                uid = resolve_id(str(nm))
+                if uid is None:
+                    unresolved.append(str(nm))
+                else:
+                    resolved.append((int(uid), pct))
+                    pct_total += pct
+
+            if unresolved:
+                if resolved_group_id is not None:
+                    names = [
+                        f"{getattr(m, 'getFirstName', lambda: '')() or ''} {getattr(m, 'getLastName', lambda: '')() or ''}".strip()
+                        for m in members
+                    ]
+                    return {
+                        "ok": False,
+                        "errors": [
+                            "Could not resolve these names: " + ", ".join(unresolved),
+                            "Group members I can see: " + ", ".join([n for n in names if n]),
+                        ],
+                    }
+                return {"ok": False, "errors": ["Could not resolve these names: " + ", ".join(unresolved)]}
+
+            if abs(pct_total - 100.0) > 0.01:
+                return {"ok": False, "errors": [f"percent_split must sum to 100. Got {pct_total:.2f}."]}
+
+            # Build unequal shares payload:
+            # - payer pays 100% (paid_share = cost)
+            # - others pay 0
+            # - owed_share determined by percent
+            users_payload: List[Dict[str, Any]] = []
+            for uid, pct in resolved:
+                owed = float(cost) * (pct / 100.0)
+                paid = float(cost) if int(uid) == int(payer_id) else 0.0
+                users_payload.append({"id": int(uid), "paid_share": paid, "owed_share": owed})
+
+            # Fix rounding drift by adjusting the last owed_share so totals match exactly (within cents)
+            owed_total = sum(u["owed_share"] for u in users_payload)
+            drift = float(cost) - owed_total
+            if abs(drift) >= 0.005:
+                users_payload[-1]["owed_share"] += drift
+
+            return await _create_expense_unequal_split_by_ids(
+                s=s,
+                description=description,
+                cost=float(cost),
+                users=users_payload,
+                group_id=resolved_group_id,
+                currency_code=currency_code,
             )
 
-        if unresolved:
-            if resolved_group_id is not None:
-                names = [
-                    f"{getattr(m, 'getFirstName', lambda: '')() or ''} {getattr(m, 'getLastName', lambda: '')() or ''}".strip()
-                    for m in members
-                ]
-                return {
-                    "ok": False,
-                    "errors": [
-                        "Could not resolve these names: " + ", ".join(unresolved),
-                        "Group members I can see: " + ", ".join([n for n in names if n]),
-                    ],
-                }
-            return {"ok": False, "errors": ["Could not resolve these names: " + ", ".join(unresolved)]}
+        # Case B: explicit shares provided
+        if shares and len(shares) > 0:
+            users_payload: List[Dict[str, Any]] = []
+            unresolved: List[str] = []
 
-        # Route to existing unequal tool
-        return await splitwise_create_expense_unequal_split(
-            description=description,
-            cost=cost,
-            users=users_payload,
-            group_id=resolved_group_id,
-            currency_code=currency_code,
-        )
+            for sh in shares:
+                nm = sh.get("name")
+                if not nm:
+                    raise ValueError("Each shares entry must include 'name'")
+                uid = resolve_id(str(nm))
+                if uid is None:
+                    unresolved.append(str(nm))
+                    continue
 
-    # If we reach here, split_type didn't match
-    raise ValueError("split_type must be one of: 'no_split', 'equal', 'unequal'")
+                users_payload.append(
+                    {
+                        "id": int(uid),
+                        "paid_share": float(sh.get("paid_share", sh.get("paidShare", 0.0))),
+                        "owed_share": float(sh.get("owed_share", sh.get("owedShare", 0.0))),
+                    }
+                )
+
+            if unresolved:
+                if resolved_group_id is not None:
+                    names = [
+                        f"{getattr(m, 'getFirstName', lambda: '')() or ''} {getattr(m, 'getLastName', lambda: '')() or ''}".strip()
+                        for m in members
+                    ]
+                    return {
+                        "ok": False,
+                        "errors": [
+                            "Could not resolve these names: " + ", ".join(unresolved),
+                            "Group members I can see: " + ", ".join([n for n in names if n]),
+                        ],
+                    }
+                return {"ok": False, "errors": ["Could not resolve these names: " + ", ".join(unresolved)]}
+
+            return await _create_expense_unequal_split_by_ids(
+                s=s,
+                description=description,
+                cost=float(cost),
+                users=users_payload,
+                group_id=resolved_group_id,
+                currency_code=currency_code,
+            )
+
+        raise ValueError("For split_type='unequal', provide either 'percent_split' or 'shares'.")
+
+    raise ValueError("split_type must be one of: 'equal', 'no_split', 'unequal'")
 
 
 # =============================================================================
@@ -670,5 +700,4 @@ async def splitwise_create_expense_router(
 # =============================================================================
 
 if __name__ == "__main__":
-    # HTTP transport is suitable for cloud hosting and remote clients
     mcp.run(transport="http", host="0.0.0.0", port=8000)
