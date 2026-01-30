@@ -1,59 +1,131 @@
 """
-Splitwise MCP Server (Async) — Single Create Tool (Shares-based)
+Splitwise MCP Server (Async) — Public Multi-User (BYO Splitwise creds) + Auth0
 
-Why this design:
-- LLM clients sometimes call the wrong tool (e.g. always equal split).
-- So we expose ONLY ONE "create expense" tool that supports:
-  - Equal split (auto-computed)
-  - No split (100/0)
-  - Unequal split (explicit owed amounts)
-  - Percent split (owed percentages)
-  - Single payer (default) or multi-payer (optional)
+Goal:
+- Each caller uses THEIR OWN Splitwise credentials.
+- Nothing ever uses your Splitwise account unless YOU (your Auth0 user) saved your creds.
 
-Important:
-- Splitwise Python SDK is synchronous.
-- We wrap SDK calls using asyncio.to_thread(...) to keep MCP tools async.
+How it works:
+1) Auth0 authenticates the caller -> we get a stable user id ("sub").
+2) We store that user's Splitwise creds (encrypted) in Redis under splitwise:{sub}:creds
+3) Every tool loads creds for the current caller and creates a Splitwise client from them.
+
+Requirements (env vars):
+Auth0:
+- AUTH0_CONFIG_URL
+- AUTH0_CLIENT_ID
+- AUTH0_CLIENT_SECRET
+- AUTH0_AUDIENCE
+- PUBLIC_BASE_URL   (e.g. https://visioner.fastmcp.app)
+
+Redis:
+- REDIS_HOST
+- REDIS_PORT (optional, default 6379)
+- REDIS_PASSWORD (optional)
+- REDIS_SSL (optional, default "true")
+
+Encryption:
+- FERNET_KEY   (generate once; keep secret; do not rotate casually)
+
+Notes:
+- Splitwise Python SDK is synchronous; we wrap calls with asyncio.to_thread(...)
+- BYO only: users paste their own Splitwise app keys and OAuth token/secret (or API key)
 """
 
 import os
+import json
 import asyncio
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Any, Dict, List, Optional, Tuple
 
 from dotenv import load_dotenv
 from fastmcp import FastMCP
+from fastmcp.server import Context
+from fastmcp.server.auth.providers.auth0 import Auth0Provider
+
+from cryptography.fernet import Fernet
+from key_value.aio.stores.redis import RedisStore
+from key_value.aio.wrappers.encryption import FernetEncryptionWrapper
 
 from splitwise import Splitwise
 from splitwise.expense import Expense
 from splitwise.user import ExpenseUser
 
 load_dotenv()
-mcp = FastMCP("Splitwise MCP")
 
 
 # =============================================================================
-# Splitwise client
+# Auth0 setup (server-level auth)
 # =============================================================================
 
-def _client() -> Splitwise:
-    """Create a configured Splitwise client using env vars."""
-    consumer_key = os.environ["SPLITWISE_CONSUMER_KEY"]
-    consumer_secret = os.environ["SPLITWISE_CONSUMER_SECRET"]
+auth = Auth0Provider(
+    config_url=os.environ["AUTH0_CONFIG_URL"],
+    client_id=os.environ["AUTH0_CLIENT_ID"],
+    client_secret=os.environ["AUTH0_CLIENT_SECRET"],
+    audience=os.environ["AUTH0_AUDIENCE"],
+    base_url=os.environ["PUBLIC_BASE_URL"],
+)
 
-    api_key = os.getenv("SPLITWISE_API_KEY")
-    s = Splitwise(consumer_key, consumer_secret, api_key=api_key) if api_key else Splitwise(consumer_key, consumer_secret)
-
-    oauth_token = os.getenv("SPLITWISE_OAUTH_TOKEN")
-    oauth_token_secret = os.getenv("SPLITWISE_OAUTH_TOKEN_SECRET")
-    if oauth_token and oauth_token_secret:
-        s.setAccessToken({"oauth_token": oauth_token, "oauth_token_secret": oauth_token_secret})
-
-    return s
+mcp = FastMCP("Splitwise MCP (Public BYO)", auth=auth)
 
 
 # =============================================================================
-# Helpers: normalization / lookup
+# Storage (Redis + encryption at rest)
 # =============================================================================
+
+def _store():
+    base = RedisStore(
+        host=os.environ["REDIS_HOST"],
+        port=int(os.environ.get("REDIS_PORT", "6379")),
+        password=os.environ.get("REDIS_PASSWORD"),
+        ssl=os.environ.get("REDIS_SSL", "true").lower() == "true",
+    )
+    fernet = Fernet(os.environ["FERNET_KEY"])
+    return FernetEncryptionWrapper(key_value=base, fernet=fernet)
+
+store = _store()
+
+async def _get_creds(auth0_sub: str) -> Optional[Dict[str, Any]]:
+    raw = await store.get(f"splitwise:{auth0_sub}:creds")
+    return json.loads(raw) if raw else None
+
+async def _set_creds(auth0_sub: str, creds: Dict[str, Any]) -> None:
+    await store.set(f"splitwise:{auth0_sub}:creds", json.dumps(creds))
+
+async def _delete_creds(auth0_sub: str) -> None:
+    await store.delete(f"splitwise:{auth0_sub}:creds")
+
+
+# =============================================================================
+# Helpers: auth0 identity, normalization / lookup
+# =============================================================================
+
+def _auth0_sub(ctx: Context) -> str:
+    """
+    Extract user id from Auth0-verified request.
+    FastMCP stores auth info on request state; we handle a couple common shapes.
+    """
+    if ctx is None:
+        raise ValueError("Missing request context (ctx).")
+
+    # Most common place FastMCP auth providers attach info
+    auth_state = getattr(getattr(ctx, "request_context", None), "request", None)
+    auth_state = getattr(getattr(auth_state, "state", None), "auth", None)
+
+    if isinstance(auth_state, dict):
+        sub = (auth_state.get("extra", {}) or {}).get("sub") or auth_state.get("sub")
+        if sub:
+            return str(sub)
+
+    # Fallbacks (just in case a different structure is used)
+    # Try ctx.access_token claims style if present
+    access_token = getattr(ctx, "access_token", None)
+    claims = getattr(access_token, "claims", None)
+    if isinstance(claims, dict) and claims.get("sub"):
+        return str(claims["sub"])
+
+    raise ValueError("Missing user identity (sub) in Auth0 token.")
+
 
 def _norm(s: str) -> str:
     """Normalize strings for robust matching."""
@@ -100,6 +172,55 @@ def _find_group_by_name(groups: List[Any], group_name: str) -> Optional[Any]:
     return None
 
 
+def _d2(x: Decimal) -> Decimal:
+    """Quantize to 2 decimals (currency cents) using HALF_UP rounding."""
+    return x.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+
+# =============================================================================
+# Splitwise client per-user (BYO creds)
+# =============================================================================
+
+def _client_from_creds(creds: Dict[str, Any]) -> Splitwise:
+    """
+    Build a Splitwise SDK client using the caller's own credentials.
+    BYO means consumer_key/secret are required. api_key is optional.
+    oauth_token/secret are optional but needed for user-scoped actions.
+    """
+    consumer_key = (creds.get("consumer_key") or "").strip()
+    consumer_secret = (creds.get("consumer_secret") or "").strip()
+    if not consumer_key or not consumer_secret:
+        raise ValueError("Missing Splitwise consumer_key/consumer_secret. Run splitwise_connect_byo.")
+
+    api_key = creds.get("api_key")
+    api_key = api_key.strip() if isinstance(api_key, str) else api_key
+
+    s = Splitwise(consumer_key, consumer_secret, api_key=api_key) if api_key else Splitwise(consumer_key, consumer_secret)
+
+    oauth_token = creds.get("oauth_token")
+    oauth_token_secret = creds.get("oauth_token_secret")
+    oauth_token = oauth_token.strip() if isinstance(oauth_token, str) else oauth_token
+    oauth_token_secret = oauth_token_secret.strip() if isinstance(oauth_token_secret, str) else oauth_token_secret
+
+    if oauth_token and oauth_token_secret:
+        s.setAccessToken({"oauth_token": oauth_token, "oauth_token_secret": oauth_token_secret})
+
+    return s
+
+
+async def _get_client_for_ctx(ctx: Context) -> Splitwise:
+    """Load the current caller's creds and build their Splitwise client."""
+    sub = _auth0_sub(ctx)
+    creds = await _get_creds(sub)
+    if not creds:
+        raise ValueError("Splitwise not connected. Run splitwise_connect_byo first.")
+    return _client_from_creds(creds)
+
+
+# =============================================================================
+# Fetch helpers
+# =============================================================================
+
 async def _get_me_friends_groups(s: Splitwise) -> Tuple[Any, List[Any], List[Any]]:
     """Fetch current user, friends, groups."""
     me = await asyncio.to_thread(s.getCurrentUser)
@@ -114,9 +235,62 @@ async def _get_group_members(s: Splitwise, group_id: int) -> List[Any]:
     return getattr(g, "getMembers", lambda: [])() or []
 
 
-def _d2(x: Decimal) -> Decimal:
-    """Quantize to 2 decimals (currency cents) using HALF_UP rounding."""
-    return x.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+# =============================================================================
+# CONNECT / DISCONNECT (BYO)
+# =============================================================================
+
+@mcp.tool()
+async def splitwise_connect_byo(
+    consumer_key: str,
+    consumer_secret: str,
+    api_key: Optional[str] = None,
+    oauth_token: Optional[str] = None,
+    oauth_token_secret: Optional[str] = None,
+    ctx: Context = None,
+) -> Dict[str, Any]:
+    """
+    Save your own Splitwise credentials for your Auth0 user.
+    Run this ONCE per user. Credentials are stored encrypted in Redis.
+    """
+    sub = _auth0_sub(ctx)
+
+    creds = {
+        "consumer_key": consumer_key.strip(),
+        "consumer_secret": consumer_secret.strip(),
+        "api_key": api_key.strip() if api_key else None,
+        "oauth_token": oauth_token.strip() if oauth_token else None,
+        "oauth_token_secret": oauth_token_secret.strip() if oauth_token_secret else None,
+    }
+
+    # Validate immediately so user knows creds work
+    s = _client_from_creds(creds)
+    me = await asyncio.to_thread(s.getCurrentUser)
+
+    await _set_creds(sub, creds)
+    return {
+        "ok": True,
+        "connected_as": {
+            "id": me.getId(),
+            "first_name": me.getFirstName(),
+            "last_name": me.getLastName(),
+        },
+    }
+
+
+@mcp.tool()
+async def splitwise_disconnect(ctx: Context) -> Dict[str, Any]:
+    """Forget the current caller's saved Splitwise creds."""
+    sub = _auth0_sub(ctx)
+    await _delete_creds(sub)
+    return {"ok": True}
+
+
+@mcp.tool()
+async def splitwise_connection_status(ctx: Context) -> Dict[str, Any]:
+    """Check if the caller has connected Splitwise creds."""
+    sub = _auth0_sub(ctx)
+    creds = await _get_creds(sub)
+    return {"ok": True, "connected": bool(creds)}
 
 
 # =============================================================================
@@ -124,17 +298,17 @@ def _d2(x: Decimal) -> Decimal:
 # =============================================================================
 
 @mcp.tool()
-async def splitwise_current_user() -> Dict[str, Any]:
-    """Return the authenticated user's profile."""
-    s = _client()
+async def splitwise_current_user(ctx: Context) -> Dict[str, Any]:
+    """Return the authenticated caller's Splitwise profile."""
+    s = await _get_client_for_ctx(ctx)
     u = await asyncio.to_thread(s.getCurrentUser)
     return _user_to_dict(u)
 
 
 @mcp.tool()
-async def splitwise_friends() -> List[Dict[str, Any]]:
-    """List friends with balances."""
-    s = _client()
+async def splitwise_friends(ctx: Context) -> List[Dict[str, Any]]:
+    """List friends with balances (for the caller)."""
+    s = await _get_client_for_ctx(ctx)
     friends = await asyncio.to_thread(s.getFriends)
 
     out: List[Dict[str, Any]] = []
@@ -155,9 +329,9 @@ async def splitwise_friends() -> List[Dict[str, Any]]:
 
 
 @mcp.tool()
-async def splitwise_groups() -> List[Dict[str, Any]]:
-    """List groups."""
-    s = _client()
+async def splitwise_groups(ctx: Context) -> List[Dict[str, Any]]:
+    """List groups (for the caller)."""
+    s = await _get_client_for_ctx(ctx)
     groups = await asyncio.to_thread(s.getGroups)
     return [{"id": g.getId(), "name": g.getName()} for g in groups]
 
@@ -169,9 +343,10 @@ async def splitwise_expenses(
     group_id: Optional[int] = None,
     dated_after: Optional[str] = None,
     dated_before: Optional[str] = None,
+    ctx: Context = None,
 ) -> List[Dict[str, Any]]:
-    """Fetch expenses (light projection)."""
-    s = _client()
+    """Fetch expenses (light projection) for the caller."""
+    s = await _get_client_for_ctx(ctx)
 
     def _fetch():
         return s.getExpenses(
@@ -197,7 +372,7 @@ async def splitwise_expenses(
 
 
 # =============================================================================
-# SINGLE CREATE TOOL (shares-based) — the main fix
+# SINGLE CREATE TOOL (shares-based) — equal/unequal/no-split/percent split
 # =============================================================================
 
 @mcp.tool()
@@ -219,22 +394,13 @@ async def splitwise_create_expense_shares(
 
     # Splits list (optional): each item supports name + owed_share OR owed_percent,
     # and optionally paid_share.
-    #
-    # Examples:
-    #  - No split (they owe me full):
-    #    splits=[{"name":"me","paid_share":100,"owed_share":0},{"name":"Honey","paid_share":0,"owed_share":100}]
-    #
-    #  - Unequal amounts:
-    #    splits=[{"name":"me","paid_share":100,"owed_share":35},{"name":"Hisaab","paid_share":0,"owed_share":65}]
-    #
-    #  - Percent split:
-    #    splits=[{"name":"me","owed_percent":35},{"name":"Hisaab","owed_percent":65}]
-    #
     splits: Optional[List[Dict[str, Any]]] = None,
+
+    ctx: Context = None,
 ) -> Dict[str, Any]:
     """
     Create ONE Splitwise expense using shares.
-    This tool alone supports equal/unequal/no-split/percent split.
+    Supports equal/unequal/no-split/percent split.
 
     Rules:
     - If `splits` is provided:
@@ -245,14 +411,14 @@ async def splitwise_create_expense_shares(
         - paid_by pays 100% by default.
 
     Names:
-    - Use "me" to refer to the current user.
+    - Use "me" to refer to the current Splitwise user.
     """
     if cost <= 0:
         raise ValueError("cost must be > 0")
 
     total_cost = _d2(Decimal(str(cost)))
 
-    s = _client()
+    s = await _get_client_for_ctx(ctx)
     me, friends, groups = await _get_me_friends_groups(s)
 
     my_id = getattr(me, "getId", lambda: None)()
@@ -282,14 +448,12 @@ async def splitwise_create_expense_shares(
 
     # -------------------------------------------------------------------------
     # Build a normalized list of split entries:
-    # Each entry becomes: {id, owed_share (Decimal), paid_share (Decimal)}
+    # Each entry becomes: {id, owed_share (Decimal), paid_share (Decimal|None)}
     # -------------------------------------------------------------------------
-
     split_entries: List[Dict[str, Any]] = []
 
     # Case A: splits provided (unequal/no-split/percent)
     if splits:
-        # Resolve IDs first
         unresolved: List[str] = []
         resolved: List[Dict[str, Any]] = []
 
@@ -304,7 +468,6 @@ async def splitwise_create_expense_shares(
             resolved.append({"id": int(uid), **item})
 
         if unresolved:
-            # Provide helpful debugging info (especially for groups)
             member_names = [
                 f"{getattr(m, 'getFirstName', lambda: '')() or ''} {getattr(m, 'getLastName', lambda: '')() or ''}".strip()
                 for m in members
@@ -317,14 +480,12 @@ async def splitwise_create_expense_shares(
                 ],
             }
 
-        # Determine if we're doing owed_percent or owed_share
         uses_percent = any("owed_percent" in x or "percent" in x for x in resolved)
         uses_amount = any("owed_share" in x or "owedShare" in x for x in resolved)
 
         if uses_percent and uses_amount:
             raise ValueError("Use either owed_percent OR owed_share, not both mixed.")
 
-        # Compute owed shares
         if uses_percent:
             pct_total = Decimal("0")
             owed_list: List[Decimal] = []
@@ -336,7 +497,6 @@ async def splitwise_create_expense_shares(
             if abs(pct_total - Decimal("100")) > Decimal("0.01"):
                 return {"ok": False, "errors": [f"owed_percent must sum to 100. Got {pct_total}."]}
 
-            # Fix rounding drift by adjusting the last owed_share
             drift = total_cost - sum(owed_list, Decimal("0"))
             if drift != Decimal("0"):
                 owed_list[-1] = _d2(owed_list[-1] + drift)
@@ -390,12 +550,10 @@ async def splitwise_create_expense_shares(
                 ],
             }
 
-        # Equal owed split
         n = len(ids)
         owed_each = _d2(total_cost / Decimal(n))
         owed_list = [owed_each] * n
 
-        # Fix drift on last
         drift = total_cost - sum(owed_list, Decimal("0"))
         if drift != Decimal("0"):
             owed_list[-1] = _d2(owed_list[-1] + drift)
@@ -408,7 +566,6 @@ async def splitwise_create_expense_shares(
     # - If any paid_share provided explicitly, use those
     # - Else paid_by pays 100%
     # -------------------------------------------------------------------------
-
     any_paid_provided = any(e["paid_share"] is not None for e in split_entries)
 
     if not any_paid_provided:
@@ -418,37 +575,32 @@ async def splitwise_create_expense_shares(
 
         for e in split_entries:
             e["paid_share"] = Decimal("0.00")
-        # payer pays full
+
         found = False
         for e in split_entries:
             if int(e["id"]) == int(payer_id):
                 e["paid_share"] = total_cost
                 found = True
                 break
-        # If payer wasn't in the split list, add them with owed=0
+
         if not found:
             split_entries.append({"id": int(payer_id), "owed_share": Decimal("0.00"), "paid_share": total_cost})
 
-    # Ensure all paid_share are Decimal and 2dp
     for e in split_entries:
         e["paid_share"] = _d2(Decimal(str(e["paid_share"])))
 
-    # Validate sums (and gently fix 1-cent drift for paid/owed)
     owed_total = sum((e["owed_share"] for e in split_entries), Decimal("0"))
     paid_total = sum((e["paid_share"] for e in split_entries), Decimal("0"))
 
-    # Fix tiny owed drift by adjusting last owed participant
     owed_drift = total_cost - owed_total
     if owed_drift != Decimal("0") and split_entries:
         split_entries[-1]["owed_share"] = _d2(split_entries[-1]["owed_share"] + owed_drift)
 
-    # Fix tiny paid drift by adjusting last paid participant
     paid_total = sum((e["paid_share"] for e in split_entries), Decimal("0"))
     paid_drift = total_cost - paid_total
     if paid_drift != Decimal("0") and split_entries:
         split_entries[-1]["paid_share"] = _d2(split_entries[-1]["paid_share"] + paid_drift)
 
-    # Final check
     owed_total = sum((e["owed_share"] for e in split_entries), Decimal("0"))
     paid_total = sum((e["paid_share"] for e in split_entries), Decimal("0"))
     if abs(owed_total - total_cost) > Decimal("0.01") or abs(paid_total - total_cost) > Decimal("0.01"):
@@ -462,7 +614,6 @@ async def splitwise_create_expense_shares(
     # -------------------------------------------------------------------------
     # Create the Splitwise expense (single entry)
     # -------------------------------------------------------------------------
-
     expense = Expense()
     expense.setDescription(description)
     expense.setCost(f"{total_cost:.2f}")
@@ -485,7 +636,6 @@ async def splitwise_create_expense_shares(
     if errors:
         return {"ok": False, "errors": errors}
 
-    # Return debug info so you can verify what was created
     return {
         "ok": True,
         "expense_id": created.getId(),
@@ -499,7 +649,7 @@ async def splitwise_create_expense_shares(
 
 
 # =============================================================================
-# Other write tools
+# Other write tools (per-user)
 # =============================================================================
 
 @mcp.tool()
@@ -507,9 +657,10 @@ async def splitwise_update_expense(
     expense_id: int,
     description: Optional[str] = None,
     cost: Optional[float] = None,
+    ctx: Context = None,
 ) -> Dict[str, Any]:
-    """Update an existing expense."""
-    s = _client()
+    """Update an existing expense (for the caller)."""
+    s = await _get_client_for_ctx(ctx)
 
     e = Expense()
     e.id = int(expense_id)
@@ -525,17 +676,17 @@ async def splitwise_update_expense(
 
 
 @mcp.tool()
-async def splitwise_delete_expense(expense_id: int) -> Dict[str, Any]:
-    """Delete an expense."""
-    s = _client()
+async def splitwise_delete_expense(expense_id: int, ctx: Context = None) -> Dict[str, Any]:
+    """Delete an expense (for the caller)."""
+    s = await _get_client_for_ctx(ctx)
     success, errors = await asyncio.to_thread(s.deleteExpense, int(expense_id))
     return {"ok": bool(success), "errors": errors}
 
 
 @mcp.tool()
-async def splitwise_add_comment(expense_id: int, content: str) -> Dict[str, Any]:
-    """Add a comment to an expense."""
-    s = _client()
+async def splitwise_add_comment(expense_id: int, content: str, ctx: Context = None) -> Dict[str, Any]:
+    """Add a comment to an expense (for the caller)."""
+    s = await _get_client_for_ctx(ctx)
     comment, errors = await asyncio.to_thread(s.createComment, int(expense_id), content)
     if errors:
         return {"ok": False, "errors": errors}
