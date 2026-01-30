@@ -50,6 +50,12 @@ load_dotenv()
 # =============================================================================
 # Auth0 setup
 # =============================================================================
+def _oauth_client_storage():
+    # Uses the same Redis URL builder you already have (_redis_url()).
+    return FernetEncryptionWrapper(
+        key_value=RedisStore(url=_redis_url()),
+        fernet=Fernet(os.environ["STORAGE_ENCRYPTION_KEY"]),
+    )
 
 auth_provider = Auth0Provider(
     config_url=os.environ["AUTH0_CONFIG_URL"],
@@ -57,6 +63,9 @@ auth_provider = Auth0Provider(
     client_secret=os.environ["AUTH0_CLIENT_SECRET"],
     audience=os.environ["AUTH0_AUDIENCE"],
     base_url=os.environ["PUBLIC_BASE_URL"].rstrip("/"),
+
+    jwt_signing_key=os.environ["JWT_SIGNING_KEY"],
+    client_storage=_oauth_client_storage(),
 )
 
 mcp = FastMCP("Splitwise MCP (Public BYO)", auth=auth_provider)
