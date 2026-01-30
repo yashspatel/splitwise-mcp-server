@@ -1,19 +1,20 @@
 """
-Splitwise MCP Server (Async) — Per-request User API Key (STRICT)
+Splitwise MCP Server (Async) — STRICT per-request user API key
 
-What changed vs your original:
-- Server NO LONGER supports SPLITWISE_API_KEY in env (privacy).
-- Every tool requires the caller to provide their own Splitwise API key
-  via HTTP headers:
-    - Authorization: Bearer <SPLITWISE_API_KEY>   (recommended)
-    - OR X-Splitwise-Api-Key: <SPLITWISE_API_KEY>
+STRICT mode:
+- Server does NOT accept/use SPLITWISE_API_KEY from env (privacy).
+- Every tool call MUST include the caller's Splitwise API key in HTTP headers:
+    Authorization: Bearer <SPLITWISE_API_KEY>   (recommended)
+    OR
+    X-Splitwise-Api-Key: <SPLITWISE_API_KEY>
 
-- Splitwise Python SDK is synchronous, so all SDK calls are wrapped in
-  asyncio.to_thread(...) to keep MCP tools async.
-
-Server still requires YOUR app credentials as env vars:
+Server still requires YOUR app credentials via env vars:
 - SPLITWISE_CONSUMER_KEY
 - SPLITWISE_CONSUMER_SECRET
+
+Notes:
+- Splitwise Python SDK is synchronous, so all SDK calls are wrapped in
+  asyncio.to_thread(...) to keep MCP tools async.
 """
 
 import os
@@ -23,7 +24,9 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from dotenv import load_dotenv
 from fastmcp import FastMCP
-from fastmcp.server.dependencies import CurrentHeaders  # FastMCP DI for HTTP headers
+
+# ✅ Compatible across more FastMCP versions than CurrentHeaders()
+from fastmcp.server.dependencies import get_http_headers
 
 from splitwise import Splitwise
 from splitwise.expense import Expense
@@ -42,7 +45,7 @@ def _norm(s: str) -> str:
     return " ".join((s or "").strip().lower().split())
 
 
-def _require_splitwise_api_key(headers: Dict[str, str]) -> str:
+def _require_splitwise_api_key(headers: Optional[Dict[str, Any]]) -> str:
     """
     Strictly require a Splitwise API key from request headers.
 
@@ -51,13 +54,18 @@ def _require_splitwise_api_key(headers: Dict[str, str]) -> str:
       2) X-Splitwise-Api-Key: <api_key>
 
     Raises:
-      PermissionError if missing.
+      PermissionError if missing/invalid.
     """
     headers = headers or {}
     # normalize header keys
-    h = {str(k).lower(): (v if isinstance(v, str) else str(v)) for k, v in headers.items()}
+    h: Dict[str, str] = {}
+    for k, v in headers.items():
+        key = str(k).lower()
+        if isinstance(v, (list, tuple)):
+            v = v[0] if v else ""
+        h[key] = v if isinstance(v, str) else str(v)
 
-    auth = h.get("authorization", "")
+    auth = (h.get("authorization") or "").strip()
     if auth.lower().startswith("bearer "):
         token = auth.split(" ", 1)[1].strip()
         if token:
@@ -74,12 +82,21 @@ def _require_splitwise_api_key(headers: Dict[str, str]) -> str:
     )
 
 
+def _get_user_api_key_strict() -> str:
+    """
+    Get headers from FastMCP request context and extract user API key.
+    STRICT: if no headers / no key => fail.
+    """
+    headers = get_http_headers() or {}
+    return _require_splitwise_api_key(headers)
+
+
 # =============================================================================
 # Splitwise client (per request)
 # =============================================================================
 
 def _client(user_api_key: str) -> Splitwise:
-    """Create a configured Splitwise client using server app creds + per-request user api key."""
+    """Create a Splitwise client using server app creds + per-request user api key."""
     consumer_key = os.environ["SPLITWISE_CONSUMER_KEY"]
     consumer_secret = os.environ["SPLITWISE_CONSUMER_SECRET"]
 
@@ -158,22 +175,18 @@ def _d2(x: Decimal) -> Decimal:
 # =============================================================================
 
 @mcp.tool()
-async def splitwise_current_user(
-    headers: Dict[str, str] = CurrentHeaders(),
-) -> Dict[str, Any]:
-    """Return the authenticated Splitwise user's profile (strict per-request API key)."""
-    api_key = _require_splitwise_api_key(headers)
+async def splitwise_current_user() -> Dict[str, Any]:
+    """Return the authenticated Splitwise user's profile (STRICT per-request API key)."""
+    api_key = _get_user_api_key_strict()
     s = _client(api_key)
     u = await asyncio.to_thread(s.getCurrentUser)
     return _user_to_dict(u)
 
 
 @mcp.tool()
-async def splitwise_friends(
-    headers: Dict[str, str] = CurrentHeaders(),
-) -> List[Dict[str, Any]]:
-    """List Splitwise friends with balances (strict per-request API key)."""
-    api_key = _require_splitwise_api_key(headers)
+async def splitwise_friends() -> List[Dict[str, Any]]:
+    """List Splitwise friends with balances (STRICT per-request API key)."""
+    api_key = _get_user_api_key_strict()
     s = _client(api_key)
 
     friends = await asyncio.to_thread(s.getFriends)
@@ -196,11 +209,9 @@ async def splitwise_friends(
 
 
 @mcp.tool()
-async def splitwise_groups(
-    headers: Dict[str, str] = CurrentHeaders(),
-) -> List[Dict[str, Any]]:
-    """List Splitwise groups (strict per-request API key)."""
-    api_key = _require_splitwise_api_key(headers)
+async def splitwise_groups() -> List[Dict[str, Any]]:
+    """List Splitwise groups (STRICT per-request API key)."""
+    api_key = _get_user_api_key_strict()
     s = _client(api_key)
 
     groups = await asyncio.to_thread(s.getGroups)
@@ -214,10 +225,9 @@ async def splitwise_expenses(
     group_id: Optional[int] = None,
     dated_after: Optional[str] = None,
     dated_before: Optional[str] = None,
-    headers: Dict[str, str] = CurrentHeaders(),
 ) -> List[Dict[str, Any]]:
-    """Fetch expenses (light projection) (strict per-request API key)."""
-    api_key = _require_splitwise_api_key(headers)
+    """Fetch expenses (light projection) (STRICT per-request API key)."""
+    api_key = _get_user_api_key_strict()
     s = _client(api_key)
 
     def _fetch():
@@ -260,37 +270,21 @@ async def splitwise_create_expense_shares(
     # Default payer (optional): if paid_share not provided, payer pays 100%
     paid_by: str = "me",
 
-    # Participants for equal split (optional). If owed_share/owed_percent are not provided,
-    # we will split equally among these names.
+    # Participants for equal split (optional)
     participants: Optional[List[str]] = None,
 
-    # Splits list (optional): each item supports name + owed_share OR owed_percent,
-    # and optionally paid_share.
+    # Splits list (optional)
     splits: Optional[List[Dict[str, Any]]] = None,
-
-    # Injected request headers (strict API key)
-    headers: Dict[str, str] = CurrentHeaders(),
 ) -> Dict[str, Any]:
     """
     Create ONE Splitwise expense using shares.
-    This tool supports equal/unequal/no-split/percent split.
+    Supports equal/unequal/no-split/percent split.
 
     STRICT AUTH:
     - Requires user's Splitwise API key via request headers:
       Authorization: Bearer <key>  OR  X-Splitwise-Api-Key: <key>
-
-    Rules:
-    - If `splits` is provided:
-        - owed_share OR owed_percent must be present for each participant (owed_percent sums to 100).
-        - paid_share is optional; if missing for everyone, defaults to "paid_by pays 100%".
-    - If `splits` is NOT provided:
-        - `participants` must be provided, and the tool does equal split automatically.
-        - paid_by pays 100% by default.
-
-    Names:
-    - Use "me" to refer to the current user.
     """
-    api_key = _require_splitwise_api_key(headers)
+    api_key = _get_user_api_key_strict()
     s = _client(api_key)
 
     if cost <= 0:
@@ -324,11 +318,6 @@ async def splitwise_create_expense_shares(
         if nn in ("me", "myself", "i"):
             return int(my_id)
         return _find_user_id_by_name(members, name) or _find_user_id_by_name(friends, name)
-
-    # -------------------------------------------------------------------------
-    # Build normalized split entries:
-    # Each entry: {id, owed_share (Decimal), paid_share (Decimal|None)}
-    # -------------------------------------------------------------------------
 
     split_entries: List[Dict[str, Any]] = []
 
@@ -366,7 +355,6 @@ async def splitwise_create_expense_shares(
         if uses_percent and uses_amount:
             raise ValueError("Use either owed_percent OR owed_share, not both mixed.")
 
-        # Compute owed shares
         if uses_percent:
             pct_total = Decimal("0")
             owed_list: List[Decimal] = []
@@ -378,7 +366,6 @@ async def splitwise_create_expense_shares(
             if abs(pct_total - Decimal("100")) > Decimal("0.01"):
                 return {"ok": False, "errors": [f"owed_percent must sum to 100. Got {pct_total}."]}
 
-            # Fix rounding drift by adjusting the last owed_share
             drift = total_cost - sum(owed_list, Decimal("0"))
             if drift != Decimal("0"):
                 owed_list[-1] = _d2(owed_list[-1] + drift)
@@ -443,12 +430,7 @@ async def splitwise_create_expense_shares(
         for uid, owed in zip(ids, owed_list):
             split_entries.append({"id": uid, "owed_share": owed, "paid_share": None})
 
-    # -------------------------------------------------------------------------
-    # Decide paid shares:
-    # - If any paid_share provided explicitly, use those
-    # - Else paid_by pays 100%
-    # -------------------------------------------------------------------------
-
+    # Decide paid shares
     any_paid_provided = any(e["paid_share"] is not None for e in split_entries)
 
     if not any_paid_provided:
@@ -469,14 +451,11 @@ async def splitwise_create_expense_shares(
         if not found:
             split_entries.append({"id": int(payer_id), "owed_share": Decimal("0.00"), "paid_share": total_cost})
 
-    # Ensure all paid_share are Decimal and 2dp
     for e in split_entries:
         e["paid_share"] = _d2(Decimal(str(e["paid_share"])))
 
-    # Validate sums (and gently fix 1-cent drift for paid/owed)
+    # Fix tiny drifts
     owed_total = sum((e["owed_share"] for e in split_entries), Decimal("0"))
-    paid_total = sum((e["paid_share"] for e in split_entries), Decimal("0"))
-
     owed_drift = total_cost - owed_total
     if owed_drift != Decimal("0") and split_entries:
         split_entries[-1]["owed_share"] = _d2(split_entries[-1]["owed_share"] + owed_drift)
@@ -496,10 +475,7 @@ async def splitwise_create_expense_shares(
             ],
         }
 
-    # -------------------------------------------------------------------------
-    # Create the Splitwise expense
-    # -------------------------------------------------------------------------
-
+    # Create expense
     expense = Expense()
     expense.setDescription(description)
     expense.setCost(f"{total_cost:.2f}")
@@ -543,10 +519,9 @@ async def splitwise_update_expense(
     expense_id: int,
     description: Optional[str] = None,
     cost: Optional[float] = None,
-    headers: Dict[str, str] = CurrentHeaders(),
 ) -> Dict[str, Any]:
-    """Update an existing expense (strict per-request API key)."""
-    api_key = _require_splitwise_api_key(headers)
+    """Update an existing expense (STRICT per-request API key)."""
+    api_key = _get_user_api_key_strict()
     s = _client(api_key)
 
     e = Expense()
@@ -563,12 +538,9 @@ async def splitwise_update_expense(
 
 
 @mcp.tool()
-async def splitwise_delete_expense(
-    expense_id: int,
-    headers: Dict[str, str] = CurrentHeaders(),
-) -> Dict[str, Any]:
-    """Delete an expense (strict per-request API key)."""
-    api_key = _require_splitwise_api_key(headers)
+async def splitwise_delete_expense(expense_id: int) -> Dict[str, Any]:
+    """Delete an expense (STRICT per-request API key)."""
+    api_key = _get_user_api_key_strict()
     s = _client(api_key)
 
     success, errors = await asyncio.to_thread(s.deleteExpense, int(expense_id))
@@ -576,13 +548,9 @@ async def splitwise_delete_expense(
 
 
 @mcp.tool()
-async def splitwise_add_comment(
-    expense_id: int,
-    content: str,
-    headers: Dict[str, str] = CurrentHeaders(),
-) -> Dict[str, Any]:
-    """Add a comment to an expense (strict per-request API key)."""
-    api_key = _require_splitwise_api_key(headers)
+async def splitwise_add_comment(expense_id: int, content: str) -> Dict[str, Any]:
+    """Add a comment to an expense (STRICT per-request API key)."""
+    api_key = _get_user_api_key_strict()
     s = _client(api_key)
 
     comment, errors = await asyncio.to_thread(s.createComment, int(expense_id), content)
