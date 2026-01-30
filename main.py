@@ -52,6 +52,8 @@ from splitwise.expense import Expense
 from splitwise.user import ExpenseUser
 
 load_dotenv()
+import fastmcp
+print("FAST_MCP_VERSION =", getattr(fastmcp, "__version__", "unknown"))
 
 
 # =============================================================================
