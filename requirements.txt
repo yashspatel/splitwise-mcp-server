@@ -1,3 +1,5 @@
 fastmcp
 python-dotenv
 splitwise
+cryptography
+py-key-value-aio[redis]
