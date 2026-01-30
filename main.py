@@ -1,45 +1,63 @@
 """
-Splitwise MCP Server (Async) — Public BYO (Bring Your Own Splitwise Keys)
+Splitwise MCP Server (Async) — Public Multi-User (BYO Splitwise creds) + Auth0 + Redis
 
-Goal:
-- Public server where each user uses THEIR OWN Splitwise credentials.
-- Nothing ever touches your Splitwise account unless YOU saved YOUR keys.
-- Auth is handled by Auth0 (OAuth/OIDC).
-- Credentials are stored per-user in Redis, encrypted with Fernet.
+✅ What this solves:
+- Each user (Raj, etc.) uses THEIR OWN Splitwise credentials.
+- Expenses created by Raj go ONLY to Raj’s Splitwise.
+- Your Splitwise account is never touched unless YOU saved YOUR creds.
 
-Env vars (required by your setup):
+✅ Why Redis is used:
+- Store each user's Splitwise creds (encrypted).
+- Store Auth0 OAuth proxy client registrations + tokens (encrypted) so ChatGPT "Refresh actions"
+  keeps working even if the server restarts / scales.
+
+───────────────────────────────────────────────────────────────────────────────
+Required env vars
+
 Auth0:
-- AUTH0_CONFIG_URL
+- AUTH0_CONFIG_URL            e.g. https://YOUR_DOMAIN/.well-known/openid-configuration
 - AUTH0_CLIENT_ID
 - AUTH0_CLIENT_SECRET
 - AUTH0_AUDIENCE
-- PUBLIC_BASE_URL   (e.g. https://visioner.fastmcp.app)
+- PUBLIC_BASE_URL             e.g. https://visioner.fastmcp.app
 
 Redis:
-- REDIS_HOST
-- REDIS_PORT (optional, default 6379)
-- REDIS_PASSWORD (optional)
-- REDIS_SSL (optional, default "true")
+- REDIS_HOST                  e.g. redis-xxxx.cloud.redislabs.com
+- REDIS_PORT                  e.g. 11683
+- REDIS_PASSWORD              (from Redis Cloud)
+- REDIS_SSL                   "true" or "false" (try true first)
 
-Strongly recommended:
-- FERNET_KEY   (a Fernet key used to encrypt stored credentials)
+OAuth proxy persistence (VERY IMPORTANT for ChatGPT Refresh actions):
+- JWT_SIGNING_KEY             any long random string (keep stable forever)
+- STORAGE_ENCRYPTION_KEY      Fernet key (encrypts OAuth proxy data at rest)
+
+Splitwise creds encryption:
+- FERNET_KEY                  Fernet key (encrypts Splitwise creds at rest)
+  (If you don't set FERNET_KEY, we will reuse STORAGE_ENCRYPTION_KEY.)
+
+───────────────────────────────────────────────────────────────────────────────
+requirements.txt (recommended):
+
+fastmcp==2.14.4
+python-dotenv>=1.0.0
+splitwise>=3.0.0
+py-key-value-aio[redis]>=0.3.0
+cryptography>=42.0.0
 """
 
 import os
-import json
 import asyncio
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Any, Dict, List, Optional, Tuple
 
 from dotenv import load_dotenv
 from fastmcp import FastMCP
-
 from fastmcp.server.auth.providers.auth0 import Auth0Provider
 from fastmcp.server.dependencies import get_access_token
 
+from cryptography.fernet import Fernet
 from key_value.aio.stores.redis import RedisStore
 from key_value.aio.wrappers.encryption import FernetEncryptionWrapper
-from cryptography.fernet import Fernet
 
 from splitwise import Splitwise
 from splitwise.expense import Expense
@@ -47,31 +65,9 @@ from splitwise.user import ExpenseUser
 
 load_dotenv()
 
-# =============================================================================
-# Auth0 setup
-# =============================================================================
-def _oauth_client_storage():
-    # Uses the same Redis URL builder you already have (_redis_url()).
-    return FernetEncryptionWrapper(
-        key_value=RedisStore(url=_redis_url()),
-        fernet=Fernet(os.environ["STORAGE_ENCRYPTION_KEY"]),
-    )
-
-auth_provider = Auth0Provider(
-    config_url=os.environ["AUTH0_CONFIG_URL"],
-    client_id=os.environ["AUTH0_CLIENT_ID"],
-    client_secret=os.environ["AUTH0_CLIENT_SECRET"],
-    audience=os.environ["AUTH0_AUDIENCE"],
-    base_url=os.environ["PUBLIC_BASE_URL"].rstrip("/"),
-
-    jwt_signing_key=os.environ["JWT_SIGNING_KEY"],
-    client_storage=_oauth_client_storage(),
-)
-
-mcp = FastMCP("Splitwise MCP (Public BYO)", auth=auth_provider)
 
 # =============================================================================
-# Redis store (NO ssl kwarg — build redis/rediss URL instead)
+# Helpers: env + redis url/store
 # =============================================================================
 
 def _bool_env(name: str, default: bool = False) -> bool:
@@ -80,41 +76,147 @@ def _bool_env(name: str, default: bool = False) -> bool:
         return default
     return v in ("1", "true", "yes", "y", "on")
 
+
 def _redis_url() -> str:
+    """
+    Build redis:// or rediss:// URL.
+    We prefer URL because it’s the cleanest way to represent TLS usage.
+    """
     host = os.environ["REDIS_HOST"]
     port = int(os.environ.get("REDIS_PORT", "6379"))
     password = os.getenv("REDIS_PASSWORD")
-
     use_ssl = _bool_env("REDIS_SSL", True)
-    scheme = "rediss" if use_ssl else "redis"
 
-    # Redis URL format: redis://:password@host:port/0
+    scheme = "rediss" if use_ssl else "redis"
     if password:
         return f"{scheme}://:{password}@{host}:{port}/0"
     return f"{scheme}://{host}:{port}/0"
 
-def _store():
-    base = RedisStore(url=_redis_url())
 
-    # Encrypt stored values if FERNET_KEY provided
-    fernet_key = os.getenv("FERNET_KEY")
-    if fernet_key:
-        return FernetEncryptionWrapper(key_value=base, fernet=Fernet(fernet_key))
+def _make_redis_store() -> RedisStore:
+    """
+    Create RedisStore robustly.
+    Some versions support RedisStore(url=...), others prefer host/port/password.
+    We try url first, then fallback.
+    """
+    try:
+        return RedisStore(url=_redis_url())
+    except TypeError:
+        # Fallback if this version doesn't accept `url=`
+        host = os.environ["REDIS_HOST"]
+        port = int(os.environ.get("REDIS_PORT", "6379"))
+        password = os.getenv("REDIS_PASSWORD")
+        return RedisStore(host=host, port=port, password=password)
 
-    # If you do not set FERNET_KEY, credentials will be stored in plaintext (not recommended).
-    return base
-
-store = _store()
 
 # =============================================================================
-# Helpers
+# Auth0 OAuth proxy persistence (fixes ChatGPT "Error refreshing actions")
+# =============================================================================
+
+def _oauth_client_storage():
+    """
+    Storage for OAuth proxy registrations/tokens (NOT your Splitwise creds).
+    Must be shared & persistent for cloud deployments.
+    """
+    redis_store = _make_redis_store()
+    fernet_key = os.environ["STORAGE_ENCRYPTION_KEY"]
+    return FernetEncryptionWrapper(key_value=redis_store, fernet=Fernet(fernet_key))
+
+
+# =============================================================================
+# FastMCP server with Auth0
+# =============================================================================
+
+auth_provider = Auth0Provider(
+    config_url=os.environ["AUTH0_CONFIG_URL"],
+    client_id=os.environ["AUTH0_CLIENT_ID"],
+    client_secret=os.environ["AUTH0_CLIENT_SECRET"],
+    audience=os.environ["AUTH0_AUDIENCE"],
+    base_url=os.environ["PUBLIC_BASE_URL"].rstrip("/"),
+
+    # ✅ critical for production + ChatGPT connector stability
+    jwt_signing_key=os.environ["JWT_SIGNING_KEY"],
+    client_storage=_oauth_client_storage(),
+)
+
+mcp = FastMCP("Splitwise MCP (Public BYO)", auth=auth_provider)
+
+
+# =============================================================================
+# Splitwise creds store (per Auth0 user, encrypted at rest)
+# =============================================================================
+
+def _splitwise_creds_store():
+    redis_store = _make_redis_store()
+
+    # If you didn't set FERNET_KEY, reuse STORAGE_ENCRYPTION_KEY
+    fernet_key = os.getenv("FERNET_KEY") or os.environ["STORAGE_ENCRYPTION_KEY"]
+    return FernetEncryptionWrapper(key_value=redis_store, fernet=Fernet(fernet_key))
+
+creds_store = _splitwise_creds_store()
+
+
+def _auth0_sub() -> str:
+    """
+    Get Auth0 user id (sub) from the access token.
+    This is the key that keeps each user's data separate.
+    """
+    token = get_access_token()
+    sub = (token.claims or {}).get("sub")
+    if not sub:
+        raise ValueError("Missing Auth0 subject (sub) in access token.")
+    return str(sub)
+
+
+async def _get_creds(sub: str) -> Optional[Dict[str, Any]]:
+    # We store dicts directly; wrapper handles serialization/encryption.
+    return await creds_store.get(key=f"splitwise:{sub}:creds")
+
+
+async def _set_creds(sub: str, creds: Dict[str, Any]) -> None:
+    await creds_store.put(key=f"splitwise:{sub}:creds", value=creds)
+
+
+async def _delete_creds(sub: str) -> None:
+    await creds_store.delete(key=f"splitwise:{sub}:creds")
+
+
+# =============================================================================
+# Splitwise client per-user
+# =============================================================================
+
+def _client_from_creds(creds: Dict[str, Any]) -> Splitwise:
+    consumer_key = (creds.get("consumer_key") or "").strip()
+    consumer_secret = (creds.get("consumer_secret") or "").strip()
+    if not consumer_key or not consumer_secret:
+        raise ValueError("Missing Splitwise consumer_key/consumer_secret. Run splitwise_save_credentials first.")
+
+    api_key = creds.get("api_key") or None
+    s = Splitwise(consumer_key, consumer_secret, api_key=api_key) if api_key else Splitwise(consumer_key, consumer_secret)
+
+    oauth_token = creds.get("oauth_token") or None
+    oauth_token_secret = creds.get("oauth_token_secret") or None
+    if oauth_token and oauth_token_secret:
+        s.setAccessToken({"oauth_token": oauth_token, "oauth_token_secret": oauth_token_secret})
+
+    return s
+
+
+async def _client_for_request() -> Splitwise:
+    sub = _auth0_sub()
+    creds = await _get_creds(sub)
+    if not creds:
+        raise ValueError("Splitwise not connected for this user. Run splitwise_save_credentials first.")
+    return _client_from_creds(creds)
+
+
+# =============================================================================
+# Helpers: normalization / lookup
 # =============================================================================
 
 def _norm(s: str) -> str:
     return " ".join((s or "").strip().lower().split())
 
-def _d2(x: Decimal) -> Decimal:
-    return x.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
 
 def _user_to_dict(u: Any) -> Dict[str, Any]:
     return {
@@ -124,11 +226,11 @@ def _user_to_dict(u: Any) -> Dict[str, Any]:
         "email": getattr(u, "getEmail", lambda: None)(),
     }
 
+
 def _find_user_id_by_name(users: List[Any], name: str) -> Optional[int]:
     target = _norm(name)
     if not target:
         return None
-
     for u in users:
         first = _norm(getattr(u, "getFirstName", lambda: "")() or "")
         last = _norm(getattr(u, "getLastName", lambda: "")() or "")
@@ -136,6 +238,7 @@ def _find_user_id_by_name(users: List[Any], name: str) -> Optional[int]:
         if target == first or target == full:
             return getattr(u, "getId", lambda: None)()
     return None
+
 
 def _find_group_by_name(groups: List[Any], group_name: str) -> Optional[Any]:
     target = _norm(group_name)
@@ -146,55 +249,10 @@ def _find_group_by_name(groups: List[Any], group_name: str) -> Optional[Any]:
             return g
     return None
 
-def _auth0_sub() -> str:
-    token = get_access_token()
-    sub = (token.claims or {}).get("sub")
-    if not sub:
-        raise ValueError("Missing Auth0 subject (sub) in access token.")
-    return str(sub)
 
-async def _get_creds(sub: str) -> Optional[Dict[str, Any]]:
-    raw = await store.get(key=f"splitwise:{sub}:creds")
-    if not raw:
-        return None
-    # raw should be dict-like, but we accept JSON strings too
-    if isinstance(raw, str):
-        return json.loads(raw)
-    return raw
+def _d2(x: Decimal) -> Decimal:
+    return x.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
 
-async def _set_creds(sub: str, creds: Dict[str, Any]) -> None:
-    await store.put(key=f"splitwise:{sub}:creds", value=creds)
-
-async def _delete_creds(sub: str) -> None:
-    await store.delete(key=f"splitwise:{sub}:creds")
-
-def _client_from_creds(creds: Dict[str, Any]) -> Splitwise:
-    """
-    BYO-only:
-    Users supply their own Splitwise consumer key/secret and optionally api_key + oauth tokens.
-    """
-    consumer_key = creds["consumer_key"]
-    consumer_secret = creds["consumer_secret"]
-
-    api_key = creds.get("api_key")
-    s = Splitwise(consumer_key, consumer_secret, api_key=api_key) if api_key else Splitwise(consumer_key, consumer_secret)
-
-    oauth_token = creds.get("oauth_token")
-    oauth_token_secret = creds.get("oauth_token_secret")
-    if oauth_token and oauth_token_secret:
-        s.setAccessToken({"oauth_token": oauth_token, "oauth_token_secret": oauth_token_secret})
-
-    return s
-
-async def _client_for_request() -> Splitwise:
-    sub = _auth0_sub()
-    creds = await _get_creds(sub)
-    if not creds:
-        raise ValueError(
-            "No Splitwise credentials saved for this user. "
-            "Call splitwise_save_credentials first (BYO keys)."
-        )
-    return _client_from_creds(creds)
 
 async def _get_me_friends_groups(s: Splitwise) -> Tuple[Any, List[Any], List[Any]]:
     me = await asyncio.to_thread(s.getCurrentUser)
@@ -202,12 +260,39 @@ async def _get_me_friends_groups(s: Splitwise) -> Tuple[Any, List[Any], List[Any
     groups = await asyncio.to_thread(s.getGroups)
     return me, friends, groups
 
+
 async def _get_group_members(s: Splitwise, group_id: int) -> List[Any]:
     g = await asyncio.to_thread(s.getGroup, int(group_id))
     return getattr(g, "getMembers", lambda: [])() or []
 
+
 # =============================================================================
-# NEW: Credential management tools (BYO)
+# Debug / sanity tool (helps you test connector end-to-end)
+# =============================================================================
+
+@mcp.tool()
+async def ping() -> Dict[str, Any]:
+    return {"ok": True, "msg": "pong"}
+
+
+@mcp.tool()
+async def auth_debug_token_info() -> Dict[str, Any]:
+    """
+    Debug tool to confirm ChatGPT is sending a valid token.
+    Safe: does not reveal secrets.
+    """
+    token = get_access_token()
+    claims = token.claims or {}
+    return {
+        "iss": claims.get("iss"),
+        "aud": claims.get("aud"),
+        "scope": claims.get("scope"),
+        "sub": claims.get("sub"),
+    }
+
+
+# =============================================================================
+# BYO credential management tools
 # =============================================================================
 
 @mcp.tool()
@@ -219,8 +304,8 @@ async def splitwise_save_credentials(
     oauth_token_secret: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
-    Save YOUR Splitwise credentials (BYO).
-    These are stored per Auth0 user (sub) in Redis.
+    User runs this ONCE to save their Splitwise credentials.
+    Stored per Auth0 user (sub), encrypted in Redis.
     """
     sub = _auth0_sub()
     creds = {
@@ -230,16 +315,25 @@ async def splitwise_save_credentials(
         "oauth_token": oauth_token.strip() if oauth_token else None,
         "oauth_token_secret": oauth_token_secret.strip() if oauth_token_secret else None,
     }
+
+    # Validate quickly (so user knows they pasted correct keys)
+    s = _client_from_creds(creds)
+    me = await asyncio.to_thread(s.getCurrentUser)
+
     await _set_creds(sub, creds)
-    return {"ok": True, "message": "Saved Splitwise credentials for this Auth0 user."}
+    return {"ok": True, "connected_as": _user_to_dict(me)}
+
 
 @mcp.tool()
 async def splitwise_credentials_status() -> Dict[str, Any]:
-    """Shows whether you have saved Splitwise credentials (without revealing secrets)."""
+    """
+    Check whether Splitwise creds are saved (does not reveal actual secrets).
+    """
     sub = _auth0_sub()
     creds = await _get_creds(sub)
     if not creds:
         return {"ok": True, "saved": False}
+
     return {
         "ok": True,
         "saved": True,
@@ -247,15 +341,16 @@ async def splitwise_credentials_status() -> Dict[str, Any]:
         "has_oauth_token": bool(creds.get("oauth_token") and creds.get("oauth_token_secret")),
     }
 
+
 @mcp.tool()
 async def splitwise_clear_credentials() -> Dict[str, Any]:
-    """Deletes your saved Splitwise credentials from Redis."""
     sub = _auth0_sub()
     await _delete_creds(sub)
-    return {"ok": True, "message": "Deleted Splitwise credentials for this Auth0 user."}
+    return {"ok": True}
+
 
 # =============================================================================
-# READ TOOLS (now per-user)
+# READ TOOLS
 # =============================================================================
 
 @mcp.tool()
@@ -263,6 +358,7 @@ async def splitwise_current_user() -> Dict[str, Any]:
     s = await _client_for_request()
     u = await asyncio.to_thread(s.getCurrentUser)
     return _user_to_dict(u)
+
 
 @mcp.tool()
 async def splitwise_friends() -> List[Dict[str, Any]]:
@@ -282,13 +378,16 @@ async def splitwise_friends() -> List[Dict[str, Any]]:
             )
         item["balances"] = balances
         out.append(item)
+
     return out
+
 
 @mcp.tool()
 async def splitwise_groups() -> List[Dict[str, Any]]:
     s = await _client_for_request()
     groups = await asyncio.to_thread(s.getGroups)
     return [{"id": g.getId(), "name": g.getName()} for g in groups]
+
 
 @mcp.tool()
 async def splitwise_expenses(
@@ -322,8 +421,9 @@ async def splitwise_expenses(
         for e in expenses
     ]
 
+
 # =============================================================================
-# SINGLE CREATE TOOL (shares-based) — unchanged logic, now per-user
+# SINGLE CREATE TOOL (shares-based) — equal/unequal/no-split/percent split
 # =============================================================================
 
 @mcp.tool()
@@ -331,8 +431,10 @@ async def splitwise_create_expense_shares(
     description: str,
     cost: float,
     currency_code: Optional[str] = None,
+
     group_id: Optional[int] = None,
     group_name: Optional[str] = None,
+
     paid_by: str = "me",
     participants: Optional[List[str]] = None,
     splits: Optional[List[Dict[str, Any]]] = None,
@@ -369,6 +471,7 @@ async def splitwise_create_expense_shares(
 
     split_entries: List[Dict[str, Any]] = []
 
+    # Case A: splits provided (unequal/no-split/percent)
     if splits:
         unresolved: List[str] = []
         resolved: List[Dict[str, Any]] = []
@@ -398,7 +501,6 @@ async def splitwise_create_expense_shares(
 
         uses_percent = any("owed_percent" in x or "percent" in x for x in resolved)
         uses_amount = any("owed_share" in x or "owedShare" in x for x in resolved)
-
         if uses_percent and uses_amount:
             raise ValueError("Use either owed_percent OR owed_share, not both mixed.")
 
@@ -439,6 +541,7 @@ async def splitwise_create_expense_shares(
         else:
             raise ValueError("Each split must include owed_share or owed_percent.")
 
+    # Case B: no splits -> equal split among participants
     else:
         if not participants:
             raise ValueError("Provide either `splits` or `participants`.")
@@ -476,8 +579,8 @@ async def splitwise_create_expense_shares(
         for uid, owed in zip(ids, owed_list):
             split_entries.append({"id": uid, "owed_share": owed, "paid_share": None})
 
+    # Decide paid shares
     any_paid_provided = any(e["paid_share"] is not None for e in split_entries)
-
     if not any_paid_provided:
         payer_id = resolve_id(paid_by)
         if payer_id is None:
@@ -499,6 +602,8 @@ async def splitwise_create_expense_shares(
     for e in split_entries:
         e["paid_share"] = _d2(Decimal(str(e["paid_share"])))
 
+
+    # Fix tiny drifts
     owed_total = sum((e["owed_share"] for e in split_entries), Decimal("0"))
     owed_drift = total_cost - owed_total
     if owed_drift != Decimal("0") and split_entries:
@@ -517,6 +622,7 @@ async def splitwise_create_expense_shares(
             "errors": [f"Shares invalid after rounding: owed_total={owed_total}, paid_total={paid_total}, cost={total_cost}"],
         }
 
+    # Create expense
     expense = Expense()
     expense.setDescription(description)
     expense.setCost(f"{total_cost:.2f}")
@@ -550,8 +656,9 @@ async def splitwise_create_expense_shares(
         ],
     }
 
+
 # =============================================================================
-# Other write tools (per-user)
+# Other write tools
 # =============================================================================
 
 @mcp.tool()
@@ -574,11 +681,13 @@ async def splitwise_update_expense(
         return {"ok": False, "errors": errors}
     return {"ok": True, "expense_id": updated.getId()}
 
+
 @mcp.tool()
 async def splitwise_delete_expense(expense_id: int) -> Dict[str, Any]:
     s = await _client_for_request()
     success, errors = await asyncio.to_thread(s.deleteExpense, int(expense_id))
     return {"ok": bool(success), "errors": errors}
+
 
 @mcp.tool()
 async def splitwise_add_comment(expense_id: int, content: str) -> Dict[str, Any]:
@@ -588,10 +697,12 @@ async def splitwise_add_comment(expense_id: int, content: str) -> Dict[str, Any]
         return {"ok": False, "errors": errors}
     return {"ok": True, "comment_id": comment.getId(), "content": comment.getContent()}
 
+
 # =============================================================================
 # Entrypoint
 # =============================================================================
 
 if __name__ == "__main__":
+    # FastMCP Cloud often sets PORT automatically
     port = int(os.environ.get("PORT", "8000"))
     mcp.run(transport="http", host="0.0.0.0", port=port)
