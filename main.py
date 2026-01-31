@@ -509,7 +509,7 @@ async def splitwise_update_expense(
     updated, errors = await asyncio.to_thread(s.updateExpense, e)
     if errors:
         return {"ok": False, "errors": errors}
-    return {"ok": True, "expense_id": updated.getId())
+    return {"ok": True, "expense_id": updated.getId()}
 
 @mcp.tool()
 async def splitwise_delete_expense(expense_id: int) -> Dict[str, Any]:
