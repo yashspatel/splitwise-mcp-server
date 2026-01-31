@@ -30,7 +30,6 @@ from splitwise.user import ExpenseUser
 load_dotenv()
 mcp = FastMCP("Splitwise MCP")
 
-
 # =============================================================================
 # Splitwise client
 # =============================================================================
@@ -50,7 +49,6 @@ def _client() -> Splitwise:
 
     return s
 
-
 # =============================================================================
 # Helpers: normalization / lookup
 # =============================================================================
@@ -58,7 +56,6 @@ def _client() -> Splitwise:
 def _norm(s: str) -> str:
     """Normalize strings for robust matching."""
     return " ".join((s or "").strip().lower().split())
-
 
 def _user_to_dict(u: Any) -> Dict[str, Any]:
     """Convert Splitwise user-like objects to JSON-friendly dict."""
@@ -68,7 +65,6 @@ def _user_to_dict(u: Any) -> Dict[str, Any]:
         "last_name": getattr(u, "getLastName", lambda: None)(),
         "email": getattr(u, "getEmail", lambda: None)(),
     }
-
 
 def _find_user_id_by_name(users: List[Any], name: str) -> Optional[int]:
     """Match by first name OR full name."""
@@ -86,7 +82,6 @@ def _find_user_id_by_name(users: List[Any], name: str) -> Optional[int]:
 
     return None
 
-
 def _find_group_by_name(groups: List[Any], group_name: str) -> Optional[Any]:
     """Find group by name (case-insensitive)."""
     target = _norm(group_name)
@@ -99,7 +94,6 @@ def _find_group_by_name(groups: List[Any], group_name: str) -> Optional[Any]:
 
     return None
 
-
 async def _get_me_friends_groups(s: Splitwise) -> Tuple[Any, List[Any], List[Any]]:
     """Fetch current user, friends, groups."""
     me = await asyncio.to_thread(s.getCurrentUser)
@@ -107,17 +101,14 @@ async def _get_me_friends_groups(s: Splitwise) -> Tuple[Any, List[Any], List[Any
     groups = await asyncio.to_thread(s.getGroups)
     return me, friends, groups
 
-
 async def _get_group_members(s: Splitwise, group_id: int) -> List[Any]:
     """Fetch group details and return members."""
     g = await asyncio.to_thread(s.getGroup, int(group_id))
     return getattr(g, "getMembers", lambda: [])() or []
 
-
 def _d2(x: Decimal) -> Decimal:
     """Quantize to 2 decimals (currency cents) using HALF_UP rounding."""
     return x.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
-
 
 # =============================================================================
 # READ TOOLS
@@ -129,7 +120,6 @@ async def splitwise_current_user() -> Dict[str, Any]:
     s = _client()
     u = await asyncio.to_thread(s.getCurrentUser)
     return _user_to_dict(u)
-
 
 @mcp.tool()
 async def splitwise_friends() -> List[Dict[str, Any]]:
@@ -153,14 +143,12 @@ async def splitwise_friends() -> List[Dict[str, Any]]:
 
     return out
 
-
 @mcp.tool()
 async def splitwise_groups() -> List[Dict[str, Any]]:
     """List groups."""
     s = _client()
     groups = await asyncio.to_thread(s.getGroups)
     return [{"id": g.getId(), "name": g.getName()} for g in groups]
-
 
 @mcp.tool()
 async def splitwise_expenses(
@@ -194,7 +182,6 @@ async def splitwise_expenses(
         }
         for e in expenses
     ]
-
 
 # =============================================================================
 # SINGLE CREATE TOOL (shares-based) — the main fix
@@ -366,7 +353,7 @@ async def splitwise_create_expense_shares(
     # Case B: no splits -> equal split among participants
     else:
         if not participants:
-            raise ValueError("Provide either `splits` or `participants`.")
+            raise ValueError("Provide either splits or participants.")
 
         ids: List[int] = []
         unresolved: List[str] = []
@@ -418,6 +405,7 @@ async def splitwise_create_expense_shares(
 
         for e in split_entries:
             e["paid_share"] = Decimal("0.00")
+
         # payer pays full
         found = False
         for e in split_entries:
@@ -425,6 +413,7 @@ async def splitwise_create_expense_shares(
                 e["paid_share"] = total_cost
                 found = True
                 break
+
         # If payer wasn't in the split list, add them with owed=0
         if not found:
             split_entries.append({"id": int(payer_id), "owed_share": Decimal("0.00"), "paid_share": total_cost})
@@ -497,7 +486,6 @@ async def splitwise_create_expense_shares(
         ],
     }
 
-
 # =============================================================================
 # Other write tools
 # =============================================================================
@@ -521,8 +509,7 @@ async def splitwise_update_expense(
     updated, errors = await asyncio.to_thread(s.updateExpense, e)
     if errors:
         return {"ok": False, "errors": errors}
-    return {"ok": True, "expense_id": updated.getId()}
-
+    return {"ok": True, "expense_id": updated.getId())
 
 @mcp.tool()
 async def splitwise_delete_expense(expense_id: int) -> Dict[str, Any]:
@@ -530,7 +517,6 @@ async def splitwise_delete_expense(expense_id: int) -> Dict[str, Any]:
     s = _client()
     success, errors = await asyncio.to_thread(s.deleteExpense, int(expense_id))
     return {"ok": bool(success), "errors": errors}
-
 
 @mcp.tool()
 async def splitwise_add_comment(expense_id: int, content: str) -> Dict[str, Any]:
@@ -540,7 +526,6 @@ async def splitwise_add_comment(expense_id: int, content: str) -> Dict[str, Any]
     if errors:
         return {"ok": False, "errors": errors}
     return {"ok": True, "comment_id": comment.getId(), "content": comment.getContent()}
-
 
 # =============================================================================
 # Entrypoint
