@@ -14,9 +14,9 @@ Important:
 - Splitwise Python SDK is synchronous.
 - We wrap SDK calls using asyncio.to_thread(...) to keep MCP tools async.
 
-Fixes added:
-1) Prevent double-creates: Idempotency / de-dupe (TTL cache) so accidental retries don't create duplicates.
-2) Confirmation flow: All write tools are preview-only unless confirm=True.
+Hard safety rule (implemented here):
+- NO write to Splitwise is allowed unless there was a prior preview that produced a confirmation_token.
+- A client cannot "skip asking" by sending confirm=True directly, because commit requires a valid token.
 """
 
 import os
@@ -24,6 +24,7 @@ import asyncio
 import time
 import json
 import hashlib
+import uuid
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Any, Dict, List, Optional, Tuple, NamedTuple
 
@@ -38,10 +39,11 @@ load_dotenv()
 mcp = FastMCP("Splitwise MCP")
 
 # =============================================================================
-# Idempotency / De-dupe cache (in-memory)
+# In-memory caches (idempotency + confirmations)
 # =============================================================================
 
-_DEDUPE_TTL_SEC = 120  # window to treat identical create requests as duplicates
+_DEDUPE_TTL_SEC = 120          # de-dupe window for identical creates
+_CONFIRM_TTL_SEC = 15 * 60     # confirmation token lifetime (15 minutes)
 
 
 class _DedupeEntry(NamedTuple):
@@ -49,23 +51,67 @@ class _DedupeEntry(NamedTuple):
     response: Dict[str, Any]
 
 
+class _ConfirmEntry(NamedTuple):
+    ts: float
+    action: str
+    payload: Dict[str, Any]
+
+
 _recent_creates: Dict[str, _DedupeEntry] = {}
+_pending_confirms: Dict[str, _ConfirmEntry] = {}
 
 
 def _now() -> float:
     return time.time()
 
 
-def _prune_dedupe_cache() -> None:
-    cutoff = _now() - _DEDUPE_TTL_SEC
-    dead = [k for k, v in _recent_creates.items() if v.ts < cutoff]
+def _prune_cache() -> None:
+    # prune create de-dupe
+    d_cutoff = _now() - _DEDUPE_TTL_SEC
+    dead = [k for k, v in _recent_creates.items() if v.ts < d_cutoff]
     for k in dead:
         _recent_creates.pop(k, None)
+
+    # prune confirmation tokens
+    c_cutoff = _now() - _CONFIRM_TTL_SEC
+    dead2 = [k for k, v in _pending_confirms.items() if v.ts < c_cutoff]
+    for k in dead2:
+        _pending_confirms.pop(k, None)
 
 
 def _stable_hash(payload: Dict[str, Any]) -> str:
     raw = json.dumps(payload, sort_keys=True, ensure_ascii=True, default=str).encode("utf-8")
     return hashlib.sha256(raw).hexdigest()
+
+
+def _make_confirmation(action: str, payload: Dict[str, Any]) -> str:
+    _prune_cache()
+    token = str(uuid.uuid4())
+    _pending_confirms[token] = _ConfirmEntry(ts=_now(), action=action, payload=payload)
+    return token
+
+
+def _require_confirmation(action: str, token: Optional[str], payload: Dict[str, Any]) -> Tuple[bool, Optional[str]]:
+    """
+    Returns (ok, error_message).
+    ok=True means token exists, is not expired, matches action, AND payload matches.
+    """
+    _prune_cache()
+    if not token:
+        return False, "Missing confirmation_token. Call preview first to obtain a token."
+
+    entry = _pending_confirms.get(token)
+    if not entry:
+        return False, "Invalid or expired confirmation_token. Call preview again."
+
+    if entry.action != action:
+        return False, f"confirmation_token is for a different action ({entry.action}). Call preview again."
+
+    # Require payload match so the token cannot be reused to commit something else.
+    if _stable_hash(entry.payload) != _stable_hash(payload):
+        return False, "confirmation_token payload mismatch. Call preview again."
+
+    return True, None
 
 
 # =============================================================================
@@ -234,7 +280,7 @@ async def splitwise_expenses(
 
 
 # =============================================================================
-# SINGLE CREATE TOOL (shares-based) — main tool
+# SINGLE CREATE TOOL (shares-based) — preview+token, then commit+token
 # =============================================================================
 
 @mcp.tool()
@@ -258,34 +304,20 @@ async def splitwise_create_expense_shares(
     # and optionally paid_share.
     splits: Optional[List[Dict[str, Any]]] = None,
 
-    # NEW: confirmation + idempotency
+    # Confirmation gate
     confirm: bool = False,
+    confirmation_token: Optional[str] = None,
+
+    # Idempotency / de-dupe
     request_id: Optional[str] = None,
     force_create: bool = False,
 ) -> Dict[str, Any]:
     """
     Create ONE Splitwise expense using shares.
-    This tool alone supports equal/unequal/no-split/percent split.
 
-    Confirmation:
-    - If confirm=False (default), returns preview only and does NOT create.
-    - If confirm=True, creates the expense.
-
-    De-dupe:
-    - If request_id is provided, it is used as an idempotency key.
-    - Otherwise, a stable signature hash of the payload is used.
-    - Within _DEDUPE_TTL_SEC, repeated calls return the same created expense_id.
-
-    Rules:
-    - If splits is provided:
-        - owed_share OR owed_percent must be present for each participant (owed_percent sums to 100).
-        - paid_share is optional; if missing for everyone, defaults to "paid_by pays 100%".
-    - If splits is NOT provided:
-        - participants must be provided, and the tool does equal split automatically.
-        - paid_by pays 100% by default.
-
-    Names:
-    - Use "me" to refer to the current user.
+    Safety:
+    - If confirm=False: returns preview + confirmation_token; does NOT write.
+    - If confirm=True: requires confirmation_token from a prior preview for same payload.
     """
     if cost <= 0:
         raise ValueError("cost must be > 0")
@@ -313,20 +345,15 @@ async def splitwise_create_expense_shares(
     if resolved_group_id is not None:
         members = await _get_group_members(s, int(resolved_group_id))
 
-    # Resolve a name to an id, supporting "me"
     def resolve_id(name: str) -> Optional[int]:
         nn = _norm(name)
         if nn in ("me", "myself", "i"):
             return int(my_id)
         return _find_user_id_by_name(members, name) or _find_user_id_by_name(friends, name)
 
-    # -------------------------------------------------------------------------
-    # Build a normalized list of split entries:
-    # Each entry becomes: {id, owed_share (Decimal), paid_share (Decimal)}
-    # -------------------------------------------------------------------------
+    # Build split entries
     split_entries: List[Dict[str, Any]] = []
 
-    # Case A: splits provided (unequal/no-split/percent)
     if splits:
         unresolved: List[str] = []
         resolved: List[Dict[str, Any]] = []
@@ -356,7 +383,6 @@ async def splitwise_create_expense_shares(
 
         uses_percent = any("owed_percent" in x or "percent" in x for x in resolved)
         uses_amount = any("owed_share" in x or "owedShare" in x for x in resolved)
-
         if uses_percent and uses_amount:
             raise ValueError("Use either owed_percent OR owed_share, not both mixed.")
 
@@ -383,7 +409,6 @@ async def splitwise_create_expense_shares(
                         "paid_share": _d2(Decimal(str(x.get("paid_share", x.get("paidShare", 0))))) if ("paid_share" in x or "paidShare" in x) else None,
                     }
                 )
-
         elif uses_amount:
             for x in resolved:
                 owed = Decimal(str(x.get("owed_share", x.get("owedShare", 0))))
@@ -396,8 +421,6 @@ async def splitwise_create_expense_shares(
                 )
         else:
             raise ValueError("Each split must include owed_share or owed_percent.")
-
-    # Case B: no splits -> equal split among participants
     else:
         if not participants:
             raise ValueError("Provide either splits or participants.")
@@ -427,7 +450,6 @@ async def splitwise_create_expense_shares(
         n = len(ids)
         owed_each = _d2(total_cost / Decimal(n))
         owed_list = [owed_each] * n
-
         drift = total_cost - sum(owed_list, Decimal("0"))
         if drift != Decimal("0"):
             owed_list[-1] = _d2(owed_list[-1] + drift)
@@ -435,13 +457,8 @@ async def splitwise_create_expense_shares(
         for uid, owed in zip(ids, owed_list):
             split_entries.append({"id": uid, "owed_share": owed, "paid_share": None})
 
-    # -------------------------------------------------------------------------
-    # Decide paid shares:
-    # - If any paid_share provided explicitly, use those
-    # - Else paid_by pays 100%
-    # -------------------------------------------------------------------------
+    # Decide paid shares
     any_paid_provided = any(e["paid_share"] is not None for e in split_entries)
-
     if not any_paid_provided:
         payer_id = resolve_id(paid_by)
         if payer_id is None:
@@ -463,10 +480,8 @@ async def splitwise_create_expense_shares(
     for e in split_entries:
         e["paid_share"] = _d2(Decimal(str(e["paid_share"])))
 
-    # Validate sums (and gently fix 1-cent drift for paid/owed)
+    # Validate sums and fix tiny drift
     owed_total = sum((e["owed_share"] for e in split_entries), Decimal("0"))
-    paid_total = sum((e["paid_share"] for e in split_entries), Decimal("0"))
-
     owed_drift = total_cost - owed_total
     if owed_drift != Decimal("0") and split_entries:
         split_entries[-1]["owed_share"] = _d2(split_entries[-1]["owed_share"] + owed_drift)
@@ -484,41 +499,51 @@ async def splitwise_create_expense_shares(
             "errors": [f"Shares invalid after rounding: owed_total={owed_total}, paid_total={paid_total}, cost={total_cost}"],
         }
 
-    # -------------------------------------------------------------------------
-    # Preview payload (used for confirm + dedupe key)
-    # -------------------------------------------------------------------------
     preview_payload = {
         "description": description,
         "cost": f"{total_cost:.2f}",
         "currency_code": currency_code,
         "group_id": resolved_group_id,
+        "paid_by": paid_by,
         "splits": [
             {"id": int(e["id"]), "paid_share": f"{e['paid_share']:.2f}", "owed_share": f"{e['owed_share']:.2f}"}
             for e in split_entries
         ],
     }
 
-    # If not confirmed, DO NOT write.
+    # PREVIEW path (always safe)
     if not confirm:
+        token = _make_confirmation("create", preview_payload)
         return {
             "ok": True,
             "preview": True,
-            "message": "Preview only. Re-run with confirm=True to create this expense.",
+            "message": "Preview only. Re-run with confirm=True and the confirmation_token to create this expense.",
+            "confirmation_token": token,
             **preview_payload,
         }
 
-    # -------------------------------------------------------------------------
+    # COMMIT path: require token
+    ok, err = _require_confirmation("create", confirmation_token, preview_payload)
+    if not ok:
+        # refuse to write; provide a fresh preview token so the client can recover
+        token = _make_confirmation("create", preview_payload)
+        return {
+            "ok": True,
+            "preview": True,
+            "blocked": True,
+            "message": f"Write blocked: {err}",
+            "confirmation_token": token,
+            **preview_payload,
+        }
+
     # De-dupe / idempotency
-    # -------------------------------------------------------------------------
-    _prune_dedupe_cache()
+    _prune_cache()
     dedupe_key = f"rid:{request_id}" if request_id else f"sig:{_stable_hash(preview_payload)}"
     if (not force_create) and dedupe_key in _recent_creates:
         prev = _recent_creates[dedupe_key].response
         return {**prev, "deduped": True}
 
-    # -------------------------------------------------------------------------
-    # Create the Splitwise expense (single entry)
-    # -------------------------------------------------------------------------
+    # Create expense
     expense = Expense()
     expense.setDescription(description)
     expense.setCost(f"{total_cost:.2f}")
@@ -557,7 +582,7 @@ async def splitwise_create_expense_shares(
 
 
 # =============================================================================
-# Other write tools (now require confirm=True)
+# Other write tools — require preview token, then commit token
 # =============================================================================
 
 @mcp.tool()
@@ -566,16 +591,35 @@ async def splitwise_update_expense(
     description: Optional[str] = None,
     cost: Optional[float] = None,
     confirm: bool = False,
+    confirmation_token: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Update an existing expense. Preview-only unless confirm=True."""
+    """Update an existing expense. NO write unless confirmed with a valid token."""
+    preview_payload = {
+        "expense_id": int(expense_id),
+        "description": description,
+        "cost": f"{float(cost):.2f}" if cost is not None else None,
+    }
+
     if not confirm:
+        token = _make_confirmation("update", preview_payload)
         return {
             "ok": True,
             "preview": True,
-            "message": "Preview only. Re-run with confirm=True to apply this update.",
-            "expense_id": int(expense_id),
-            "new_description": description,
-            "new_cost": f"{float(cost):.2f}" if cost is not None else None,
+            "message": "Preview only. Re-run with confirm=True and the confirmation_token to apply this update.",
+            "confirmation_token": token,
+            **preview_payload,
+        }
+
+    ok, err = _require_confirmation("update", confirmation_token, preview_payload)
+    if not ok:
+        token = _make_confirmation("update", preview_payload)
+        return {
+            "ok": True,
+            "preview": True,
+            "blocked": True,
+            "message": f"Write blocked: {err}",
+            "confirmation_token": token,
+            **preview_payload,
         }
 
     s = _client()
@@ -596,14 +640,31 @@ async def splitwise_update_expense(
 async def splitwise_delete_expense(
     expense_id: int,
     confirm: bool = False,
+    confirmation_token: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Delete an expense. Preview-only unless confirm=True."""
+    """Delete an expense. NO delete unless confirmed with a valid token."""
+    preview_payload = {"expense_id": int(expense_id)}
+
     if not confirm:
+        token = _make_confirmation("delete", preview_payload)
         return {
             "ok": True,
             "preview": True,
-            "message": "Preview only. Re-run with confirm=True to delete this expense.",
-            "expense_id": int(expense_id),
+            "message": "Preview only. Re-run with confirm=True and the confirmation_token to delete this expense.",
+            "confirmation_token": token,
+            **preview_payload,
+        }
+
+    ok, err = _require_confirmation("delete", confirmation_token, preview_payload)
+    if not ok:
+        token = _make_confirmation("delete", preview_payload)
+        return {
+            "ok": True,
+            "preview": True,
+            "blocked": True,
+            "message": f"Write blocked: {err}",
+            "confirmation_token": token,
+            **preview_payload,
         }
 
     s = _client()
@@ -616,15 +677,31 @@ async def splitwise_add_comment(
     expense_id: int,
     content: str,
     confirm: bool = False,
+    confirmation_token: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Add a comment to an expense. Preview-only unless confirm=True."""
+    """Add a comment. NO write unless confirmed with a valid token."""
+    preview_payload = {"expense_id": int(expense_id), "content": content}
+
     if not confirm:
+        token = _make_confirmation("comment", preview_payload)
         return {
             "ok": True,
             "preview": True,
-            "message": "Preview only. Re-run with confirm=True to post this comment.",
-            "expense_id": int(expense_id),
-            "content": content,
+            "message": "Preview only. Re-run with confirm=True and the confirmation_token to post this comment.",
+            "confirmation_token": token,
+            **preview_payload,
+        }
+
+    ok, err = _require_confirmation("comment", confirmation_token, preview_payload)
+    if not ok:
+        token = _make_confirmation("comment", preview_payload)
+        return {
+            "ok": True,
+            "preview": True,
+            "blocked": True,
+            "message": f"Write blocked: {err}",
+            "confirmation_token": token,
+            **preview_payload,
         }
 
     s = _client()
