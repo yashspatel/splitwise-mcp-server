@@ -1,22 +1,22 @@
 """
-Splitwise MCP Server (Async) — Multi-tenant (per-user Splitwise creds via HTTP headers)
+Splitwise MCP Server (Async) — Multi-tenant via per-user Splitwise API Key (HTTP header)
 
-What changed vs your original:
-- NO server-side SPLITWISE_API_KEY / OAuth tokens in env.
-- Each request supplies the user's Splitwise credentials via HTTP headers:
-    - x-splitwise-api-key: <user's api key>   (preferred)
+Auth model:
+- Server holds app credentials (consumer key/secret) in env:
+    SPLITWISE_CONSUMER_KEY
+    SPLITWISE_CONSUMER_SECRET
+- Each request provides the user's Splitwise API key in headers:
+    - Authorization: Bearer <splitwise_api_key>   (preferred)
       OR
-    - authorization: Bearer <user's api key> (convenience)
-      OR (OAuth1 pair)
-    - x-splitwise-oauth-token: <token>
-    - x-splitwise-oauth-token-secret: <secret>
+    - x-splitwise-api-key: <splitwise_api_key>
 
-- Confirmation tokens and idempotency/dedupe are now bound to the requesting user
-  (owner hash derived from provided creds) to avoid cross-user collisions.
+Safety model for write tools:
+- If confirm=False: returns preview + confirmation_token; does NOT write.
+- If confirm=True: requires confirmation_token from prior preview with same payload & same owner.
 
-Host env still required:
-- SPLITWISE_CONSUMER_KEY
-- SPLITWISE_CONSUMER_SECRET
+Notes:
+- This server is stateless w.r.t user secrets: it does NOT store API keys.
+- In-memory token caches are per-process. If you run multiple replicas, use Redis or sticky sessions.
 """
 
 import os
@@ -120,46 +120,37 @@ def _require_confirmation(action: str, token: Optional[str], payload: Dict[str, 
 
 
 # =============================================================================
-# Per-request credentials from headers
+# Per-request credentials from headers (API-key-only)
 # =============================================================================
 
-def _get_splitwise_creds_from_headers() -> Dict[str, Optional[str]]:
-    # Headers may be lowercased depending on stack
+def _get_splitwise_api_key_from_headers() -> Optional[str]:
+    """
+    Reads the user's Splitwise API key from either:
+    - Authorization: Bearer <key>
+    - x-splitwise-api-key: <key>
+    """
     h = get_http_headers() or {}
 
     api_key = h.get("x-splitwise-api-key")
-    oauth_token = h.get("x-splitwise-oauth-token")
-    oauth_secret = h.get("x-splitwise-oauth-token-secret")
 
-    # Allow Authorization: Bearer <api_key>
     auth = h.get("authorization")
     if (not api_key) and auth and auth.lower().startswith("bearer "):
         api_key = auth.split(" ", 1)[1].strip()
 
-    return {
-        "api_key": api_key,
-        "oauth_token": oauth_token,
-        "oauth_secret": oauth_secret,
-    }
+    return api_key
 
 
-def _owner_from_creds(creds: Dict[str, Optional[str]]) -> str:
+def _owner_from_api_key(api_key: str) -> str:
     # Never store raw secrets as "owner"; hash only.
-    if creds.get("api_key"):
-        material = f"api:{creds['api_key']}"
-    else:
-        material = f"oauth:{creds.get('oauth_token','')}:{creds.get('oauth_secret','')}"
-    return hashlib.sha256(material.encode("utf-8")).hexdigest()
+    return hashlib.sha256(f"api:{api_key}".encode("utf-8")).hexdigest()
 
 
-def _require_creds_or_error(creds: Dict[str, Optional[str]]) -> Optional[Dict[str, Any]]:
-    if creds.get("api_key"):
-        return None
-    if creds.get("oauth_token") and creds.get("oauth_secret"):
+def _require_api_key_or_error(api_key: Optional[str]) -> Optional[Dict[str, Any]]:
+    if api_key:
         return None
     return {
         "ok": False,
-        "error": "Missing Splitwise credentials. Provide x-splitwise-api-key (or Authorization: Bearer <key>) OR x-splitwise-oauth-token + x-splitwise-oauth-token-secret."
+        "error": "Missing Splitwise API key. Provide Authorization: Bearer <key> or x-splitwise-api-key: <key>."
     }
 
 
@@ -167,29 +158,23 @@ def _require_creds_or_error(creds: Dict[str, Optional[str]]) -> Optional[Dict[st
 # Splitwise client
 # =============================================================================
 
-def _client(api_key: Optional[str] = None, oauth_token: Optional[str] = None, oauth_secret: Optional[str] = None) -> Splitwise:
-    """Create a configured Splitwise client using host consumer key/secret + per-request user creds."""
+def _client(api_key: str) -> Splitwise:
+    """Create a configured Splitwise client using host consumer key/secret + per-request user api_key."""
     consumer_key = os.environ["SPLITWISE_CONSUMER_KEY"]
     consumer_secret = os.environ["SPLITWISE_CONSUMER_SECRET"]
-
-    s = Splitwise(consumer_key, consumer_secret, api_key=api_key) if api_key else Splitwise(consumer_key, consumer_secret)
-
-    if oauth_token and oauth_secret:
-        s.setAccessToken({"oauth_token": oauth_token, "oauth_token_secret": oauth_secret})
-
-    return s
+    return Splitwise(consumer_key, consumer_secret, api_key=api_key)
 
 
 def _client_from_request() -> Tuple[Optional[Splitwise], Optional[str], Optional[Dict[str, Any]]]:
     """
     Returns (client, owner, error_response).
     """
-    creds = _get_splitwise_creds_from_headers()
-    err = _require_creds_or_error(creds)
+    api_key = _get_splitwise_api_key_from_headers()
+    err = _require_api_key_or_error(api_key)
     if err:
         return None, None, err
-    owner = _owner_from_creds(creds)
-    return _client(**creds), owner, None
+    owner = _owner_from_api_key(api_key)  # type: ignore[arg-type]
+    return _client(api_key=api_key), owner, None  # type: ignore[arg-type]
 
 
 # =============================================================================
@@ -258,6 +243,27 @@ async def _get_group_members(s: Splitwise, group_id: int) -> List[Any]:
 def _d2(x: Decimal) -> Decimal:
     """Quantize to 2 decimals (currency cents) using HALF_UP rounding."""
     return x.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+
+# =============================================================================
+# AUTH / SANITY TOOL (read-only)
+# =============================================================================
+
+@mcp.tool()
+async def splitwise_auth_check() -> Dict[str, Any]:
+    """
+    Validate that the provided Splitwise API key works.
+    Returns the current user's profile if successful.
+    """
+    s, _, err = _client_from_request()
+    if err:
+        return err
+    try:
+        u = await asyncio.to_thread(s.getCurrentUser)
+        return {"ok": True, "valid": True, "user": _user_to_dict(u)}
+    except Exception as e:
+        # Keep errors generic so we don't leak anything sensitive.
+        return {"ok": False, "valid": False, "error": "Authentication failed with provided API key.", "detail": str(e)}
 
 
 # =============================================================================
@@ -797,4 +803,5 @@ async def splitwise_add_comment(
 # =============================================================================
 
 if __name__ == "__main__":
-    mcp.run(transport="http", host="0.0.0.0", port=8000)
+    # IMPORTANT: run behind HTTPS in production (reverse proxy / ingress)
+    mcp.run(transport="http", host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
