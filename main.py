@@ -1,22 +1,22 @@
 """
-Splitwise MCP Server (Async) — Single Create Tool (Shares-based)
+Splitwise MCP Server (Async) — Multi-tenant (per-user Splitwise creds via HTTP headers)
 
-Why this design:
-- LLM clients sometimes call the wrong tool (e.g. always equal split).
-- So we expose ONLY ONE "create expense" tool that supports:
-  - Equal split (auto-computed)
-  - No split (100/0)
-  - Unequal split (explicit owed amounts)
-  - Percent split (owed percentages)
-  - Single payer (default) or multi-payer (optional)
+What changed vs your original:
+- NO server-side SPLITWISE_API_KEY / OAuth tokens in env.
+- Each request supplies the user's Splitwise credentials via HTTP headers:
+    - x-splitwise-api-key: <user's api key>   (preferred)
+      OR
+    - authorization: Bearer <user's api key> (convenience)
+      OR (OAuth1 pair)
+    - x-splitwise-oauth-token: <token>
+    - x-splitwise-oauth-token-secret: <secret>
 
-Important:
-- Splitwise Python SDK is synchronous.
-- We wrap SDK calls using asyncio.to_thread(...) to keep MCP tools async.
+- Confirmation tokens and idempotency/dedupe are now bound to the requesting user
+  (owner hash derived from provided creds) to avoid cross-user collisions.
 
-Hard safety rule (implemented here):
-- NO write to Splitwise is allowed unless there was a prior preview that produced a confirmation_token.
-- A client cannot "skip asking" by sending confirm=True directly, because commit requires a valid token.
+Host env still required:
+- SPLITWISE_CONSUMER_KEY
+- SPLITWISE_CONSUMER_SECRET
 """
 
 import os
@@ -30,6 +30,7 @@ from typing import Any, Dict, List, Optional, Tuple, NamedTuple
 
 from dotenv import load_dotenv
 from fastmcp import FastMCP
+from fastmcp.server.dependencies import get_http_headers
 
 from splitwise import Splitwise
 from splitwise.expense import Expense
@@ -55,6 +56,7 @@ class _ConfirmEntry(NamedTuple):
     ts: float
     action: str
     payload: Dict[str, Any]
+    owner: str                 # bind confirmation to a specific requester
 
 
 _recent_creates: Dict[str, _DedupeEntry] = {}
@@ -84,17 +86,17 @@ def _stable_hash(payload: Dict[str, Any]) -> str:
     return hashlib.sha256(raw).hexdigest()
 
 
-def _make_confirmation(action: str, payload: Dict[str, Any]) -> str:
+def _make_confirmation(action: str, payload: Dict[str, Any], owner: str) -> str:
     _prune_cache()
     token = str(uuid.uuid4())
-    _pending_confirms[token] = _ConfirmEntry(ts=_now(), action=action, payload=payload)
+    _pending_confirms[token] = _ConfirmEntry(ts=_now(), action=action, payload=payload, owner=owner)
     return token
 
 
-def _require_confirmation(action: str, token: Optional[str], payload: Dict[str, Any]) -> Tuple[bool, Optional[str]]:
+def _require_confirmation(action: str, token: Optional[str], payload: Dict[str, Any], owner: str) -> Tuple[bool, Optional[str]]:
     """
     Returns (ok, error_message).
-    ok=True means token exists, is not expired, matches action, AND payload matches.
+    ok=True means token exists, is not expired, matches action, owner, AND payload matches.
     """
     _prune_cache()
     if not token:
@@ -103,6 +105,9 @@ def _require_confirmation(action: str, token: Optional[str], payload: Dict[str, 
     entry = _pending_confirms.get(token)
     if not entry:
         return False, "Invalid or expired confirmation_token. Call preview again."
+
+    if entry.owner != owner:
+        return False, "confirmation_token belongs to a different client. Call preview again."
 
     if entry.action != action:
         return False, f"confirmation_token is for a different action ({entry.action}). Call preview again."
@@ -115,23 +120,76 @@ def _require_confirmation(action: str, token: Optional[str], payload: Dict[str, 
 
 
 # =============================================================================
+# Per-request credentials from headers
+# =============================================================================
+
+def _get_splitwise_creds_from_headers() -> Dict[str, Optional[str]]:
+    # Headers may be lowercased depending on stack
+    h = get_http_headers() or {}
+
+    api_key = h.get("x-splitwise-api-key")
+    oauth_token = h.get("x-splitwise-oauth-token")
+    oauth_secret = h.get("x-splitwise-oauth-token-secret")
+
+    # Allow Authorization: Bearer <api_key>
+    auth = h.get("authorization")
+    if (not api_key) and auth and auth.lower().startswith("bearer "):
+        api_key = auth.split(" ", 1)[1].strip()
+
+    return {
+        "api_key": api_key,
+        "oauth_token": oauth_token,
+        "oauth_secret": oauth_secret,
+    }
+
+
+def _owner_from_creds(creds: Dict[str, Optional[str]]) -> str:
+    # Never store raw secrets as "owner"; hash only.
+    if creds.get("api_key"):
+        material = f"api:{creds['api_key']}"
+    else:
+        material = f"oauth:{creds.get('oauth_token','')}:{creds.get('oauth_secret','')}"
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()
+
+
+def _require_creds_or_error(creds: Dict[str, Optional[str]]) -> Optional[Dict[str, Any]]:
+    if creds.get("api_key"):
+        return None
+    if creds.get("oauth_token") and creds.get("oauth_secret"):
+        return None
+    return {
+        "ok": False,
+        "error": "Missing Splitwise credentials. Provide x-splitwise-api-key (or Authorization: Bearer <key>) OR x-splitwise-oauth-token + x-splitwise-oauth-token-secret."
+    }
+
+
+# =============================================================================
 # Splitwise client
 # =============================================================================
 
-def _client() -> Splitwise:
-    """Create a configured Splitwise client using env vars."""
+def _client(api_key: Optional[str] = None, oauth_token: Optional[str] = None, oauth_secret: Optional[str] = None) -> Splitwise:
+    """Create a configured Splitwise client using host consumer key/secret + per-request user creds."""
     consumer_key = os.environ["SPLITWISE_CONSUMER_KEY"]
     consumer_secret = os.environ["SPLITWISE_CONSUMER_SECRET"]
 
-    api_key = os.getenv("SPLITWISE_API_KEY")
     s = Splitwise(consumer_key, consumer_secret, api_key=api_key) if api_key else Splitwise(consumer_key, consumer_secret)
 
-    oauth_token = os.getenv("SPLITWISE_OAUTH_TOKEN")
-    oauth_token_secret = os.getenv("SPLITWISE_OAUTH_TOKEN_SECRET")
-    if oauth_token and oauth_token_secret:
-        s.setAccessToken({"oauth_token": oauth_token, "oauth_token_secret": oauth_token_secret})
+    if oauth_token and oauth_secret:
+        s.setAccessToken({"oauth_token": oauth_token, "oauth_token_secret": oauth_secret})
 
     return s
+
+
+def _client_from_request() -> Tuple[Optional[Splitwise], Optional[str], Optional[Dict[str, Any]]]:
+    """
+    Returns (client, owner, error_response).
+    """
+    creds = _get_splitwise_creds_from_headers()
+    err = _require_creds_or_error(creds)
+    if err:
+        return None, None, err
+    owner = _owner_from_creds(creds)
+    return _client(**creds), owner, None
 
 
 # =============================================================================
@@ -209,15 +267,20 @@ def _d2(x: Decimal) -> Decimal:
 @mcp.tool()
 async def splitwise_current_user() -> Dict[str, Any]:
     """Return the authenticated user's profile."""
-    s = _client()
+    s, _, err = _client_from_request()
+    if err:
+        return err
     u = await asyncio.to_thread(s.getCurrentUser)
-    return _user_to_dict(u)
+    return {"ok": True, **_user_to_dict(u)}
 
 
 @mcp.tool()
-async def splitwise_friends() -> List[Dict[str, Any]]:
+async def splitwise_friends() -> Dict[str, Any]:
     """List friends with balances."""
-    s = _client()
+    s, _, err = _client_from_request()
+    if err:
+        return err
+
     friends = await asyncio.to_thread(s.getFriends)
 
     out: List[Dict[str, Any]] = []
@@ -234,15 +297,17 @@ async def splitwise_friends() -> List[Dict[str, Any]]:
         item["balances"] = balances
         out.append(item)
 
-    return out
+    return {"ok": True, "friends": out}
 
 
 @mcp.tool()
-async def splitwise_groups() -> List[Dict[str, Any]]:
+async def splitwise_groups() -> Dict[str, Any]:
     """List groups."""
-    s = _client()
+    s, _, err = _client_from_request()
+    if err:
+        return err
     groups = await asyncio.to_thread(s.getGroups)
-    return [{"id": g.getId(), "name": g.getName()} for g in groups]
+    return {"ok": True, "groups": [{"id": g.getId(), "name": g.getName()} for g in groups]}
 
 
 @mcp.tool()
@@ -252,9 +317,11 @@ async def splitwise_expenses(
     group_id: Optional[int] = None,
     dated_after: Optional[str] = None,
     dated_before: Optional[str] = None,
-) -> List[Dict[str, Any]]:
+) -> Dict[str, Any]:
     """Fetch expenses (light projection)."""
-    s = _client()
+    s, _, err = _client_from_request()
+    if err:
+        return err
 
     def _fetch():
         return s.getExpenses(
@@ -266,17 +333,20 @@ async def splitwise_expenses(
         )
 
     expenses = await asyncio.to_thread(_fetch)
-    return [
-        {
-            "id": e.getId(),
-            "group_id": e.getGroupId(),
-            "description": e.getDescription(),
-            "cost": e.getCost(),
-            "currency_code": e.getCurrencyCode(),
-            "date": e.getDate(),
-        }
-        for e in expenses
-    ]
+    return {
+        "ok": True,
+        "expenses": [
+            {
+                "id": e.getId(),
+                "group_id": e.getGroupId(),
+                "description": e.getDescription(),
+                "cost": e.getCost(),
+                "currency_code": e.getCurrencyCode(),
+                "date": e.getDate(),
+            }
+            for e in expenses
+        ],
+    }
 
 
 # =============================================================================
@@ -317,19 +387,22 @@ async def splitwise_create_expense_shares(
 
     Safety:
     - If confirm=False: returns preview + confirmation_token; does NOT write.
-    - If confirm=True: requires confirmation_token from a prior preview for same payload.
+    - If confirm=True: requires confirmation_token from a prior preview for same payload (and same owner).
     """
     if cost <= 0:
-        raise ValueError("cost must be > 0")
+        return {"ok": False, "error": "cost must be > 0"}
+
+    s, owner, err = _client_from_request()
+    if err:
+        return err
 
     total_cost = _d2(Decimal(str(cost)))
 
-    s = _client()
     me, friends, groups = await _get_me_friends_groups(s)
 
     my_id = getattr(me, "getId", lambda: None)()
     if not my_id:
-        raise ValueError("Could not determine current user id.")
+        return {"ok": False, "error": "Could not determine current user id."}
 
     # Resolve group id by name if needed
     resolved_group_id = group_id
@@ -361,7 +434,7 @@ async def splitwise_create_expense_shares(
         for item in splits:
             name = item.get("name")
             if not name:
-                raise ValueError("Each split must include 'name'")
+                return {"ok": False, "error": "Each split must include 'name'"}
             uid = resolve_id(str(name))
             if uid is None:
                 unresolved.append(str(name))
@@ -384,7 +457,7 @@ async def splitwise_create_expense_shares(
         uses_percent = any("owed_percent" in x or "percent" in x for x in resolved)
         uses_amount = any("owed_share" in x or "owedShare" in x for x in resolved)
         if uses_percent and uses_amount:
-            raise ValueError("Use either owed_percent OR owed_share, not both mixed.")
+            return {"ok": False, "error": "Use either owed_percent OR owed_share, not both mixed."}
 
         if uses_percent:
             pct_total = Decimal("0")
@@ -420,10 +493,10 @@ async def splitwise_create_expense_shares(
                     }
                 )
         else:
-            raise ValueError("Each split must include owed_share or owed_percent.")
+            return {"ok": False, "error": "Each split must include owed_share or owed_percent."}
     else:
         if not participants:
-            raise ValueError("Provide either splits or participants.")
+            return {"ok": False, "error": "Provide either splits or participants."}
 
         ids: List[int] = []
         unresolved: List[str] = []
@@ -513,7 +586,7 @@ async def splitwise_create_expense_shares(
 
     # PREVIEW path (always safe)
     if not confirm:
-        token = _make_confirmation("create", preview_payload)
+        token = _make_confirmation("create", preview_payload, owner=owner)
         return {
             "ok": True,
             "preview": True,
@@ -523,22 +596,21 @@ async def splitwise_create_expense_shares(
         }
 
     # COMMIT path: require token
-    ok, err = _require_confirmation("create", confirmation_token, preview_payload)
+    ok, err_msg = _require_confirmation("create", confirmation_token, preview_payload, owner=owner)
     if not ok:
-        # refuse to write; provide a fresh preview token so the client can recover
-        token = _make_confirmation("create", preview_payload)
+        token = _make_confirmation("create", preview_payload, owner=owner)
         return {
             "ok": True,
             "preview": True,
             "blocked": True,
-            "message": f"Write blocked: {err}",
+            "message": f"Write blocked: {err_msg}",
             "confirmation_token": token,
             **preview_payload,
         }
 
-    # De-dupe / idempotency
+    # De-dupe / idempotency (owner-bound)
     _prune_cache()
-    dedupe_key = f"rid:{request_id}" if request_id else f"sig:{_stable_hash(preview_payload)}"
+    dedupe_key = f"{owner}|rid:{request_id}" if request_id else f"{owner}|sig:{_stable_hash(preview_payload)}"
     if (not force_create) and dedupe_key in _recent_creates:
         prev = _recent_creates[dedupe_key].response
         return {**prev, "deduped": True}
@@ -582,7 +654,7 @@ async def splitwise_create_expense_shares(
 
 
 # =============================================================================
-# Other write tools — require preview token, then commit token
+# Other write tools — require preview token, then commit token (owner-bound)
 # =============================================================================
 
 @mcp.tool()
@@ -594,6 +666,10 @@ async def splitwise_update_expense(
     confirmation_token: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Update an existing expense. NO write unless confirmed with a valid token."""
+    s, owner, err = _client_from_request()
+    if err:
+        return err
+
     preview_payload = {
         "expense_id": int(expense_id),
         "description": description,
@@ -601,7 +677,7 @@ async def splitwise_update_expense(
     }
 
     if not confirm:
-        token = _make_confirmation("update", preview_payload)
+        token = _make_confirmation("update", preview_payload, owner=owner)
         return {
             "ok": True,
             "preview": True,
@@ -610,19 +686,18 @@ async def splitwise_update_expense(
             **preview_payload,
         }
 
-    ok, err = _require_confirmation("update", confirmation_token, preview_payload)
+    ok, err_msg = _require_confirmation("update", confirmation_token, preview_payload, owner=owner)
     if not ok:
-        token = _make_confirmation("update", preview_payload)
+        token = _make_confirmation("update", preview_payload, owner=owner)
         return {
             "ok": True,
             "preview": True,
             "blocked": True,
-            "message": f"Write blocked: {err}",
+            "message": f"Write blocked: {err_msg}",
             "confirmation_token": token,
             **preview_payload,
         }
 
-    s = _client()
     e = Expense()
     e.id = int(expense_id)
     if description is not None:
@@ -643,10 +718,14 @@ async def splitwise_delete_expense(
     confirmation_token: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Delete an expense. NO delete unless confirmed with a valid token."""
+    s, owner, err = _client_from_request()
+    if err:
+        return err
+
     preview_payload = {"expense_id": int(expense_id)}
 
     if not confirm:
-        token = _make_confirmation("delete", preview_payload)
+        token = _make_confirmation("delete", preview_payload, owner=owner)
         return {
             "ok": True,
             "preview": True,
@@ -655,19 +734,18 @@ async def splitwise_delete_expense(
             **preview_payload,
         }
 
-    ok, err = _require_confirmation("delete", confirmation_token, preview_payload)
+    ok, err_msg = _require_confirmation("delete", confirmation_token, preview_payload, owner=owner)
     if not ok:
-        token = _make_confirmation("delete", preview_payload)
+        token = _make_confirmation("delete", preview_payload, owner=owner)
         return {
             "ok": True,
             "preview": True,
             "blocked": True,
-            "message": f"Write blocked: {err}",
+            "message": f"Write blocked: {err_msg}",
             "confirmation_token": token,
             **preview_payload,
         }
 
-    s = _client()
     success, errors = await asyncio.to_thread(s.deleteExpense, int(expense_id))
     return {"ok": bool(success), "errors": errors}
 
@@ -680,10 +758,14 @@ async def splitwise_add_comment(
     confirmation_token: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Add a comment. NO write unless confirmed with a valid token."""
+    s, owner, err = _client_from_request()
+    if err:
+        return err
+
     preview_payload = {"expense_id": int(expense_id), "content": content}
 
     if not confirm:
-        token = _make_confirmation("comment", preview_payload)
+        token = _make_confirmation("comment", preview_payload, owner=owner)
         return {
             "ok": True,
             "preview": True,
@@ -692,19 +774,18 @@ async def splitwise_add_comment(
             **preview_payload,
         }
 
-    ok, err = _require_confirmation("comment", confirmation_token, preview_payload)
+    ok, err_msg = _require_confirmation("comment", confirmation_token, preview_payload, owner=owner)
     if not ok:
-        token = _make_confirmation("comment", preview_payload)
+        token = _make_confirmation("comment", preview_payload, owner=owner)
         return {
             "ok": True,
             "preview": True,
             "blocked": True,
-            "message": f"Write blocked: {err}",
+            "message": f"Write blocked: {err_msg}",
             "confirmation_token": token,
             **preview_payload,
         }
 
-    s = _client()
     comment, errors = await asyncio.to_thread(s.createComment, int(expense_id), content)
     if errors:
         return {"ok": False, "errors": errors}
