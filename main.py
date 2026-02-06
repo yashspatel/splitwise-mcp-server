@@ -152,33 +152,12 @@ def _require_confirmation(action: str, token: Optional[str], payload: Dict[str, 
 # =============================================================================
 
 def _get_splitwise_key_from_headers(headers: Dict[str, Any]) -> Optional[str]:
-    """
-    Supports:
-      - Authorization: Bearer <splitwise_api_key>   (recommended)
-      - X-Splitwise-Api-Key: <splitwise_api_key>    (optional)
-
-    Returns the api key string or None.
-    """
     if not headers:
         return None
-
-    # Normalize header keys
-    try:
-        h = {str(k).lower(): str(v) for k, v in headers.items()}
-    except Exception:
-        # If it's not dict-like, best-effort
-        return None
-
-    auth = h.get("authorization", "")
-    if auth.lower().startswith("bearer "):
-        token = auth.split(" ", 1)[1].strip()
-        return token or None
-
+    h = {str(k).lower(): str(v) for k, v in headers.items()}
     xkey = h.get("x-splitwise-api-key")
-    if xkey:
-        return xkey.strip() or None
+    return xkey.strip() if xkey else None
 
-    return None
 
 
 def _client(api_key: Optional[str]) -> Splitwise:
@@ -799,3 +778,4 @@ async def splitwise_add_comment(
 
 if __name__ == "__main__":
     mcp.run(transport="http", host="0.0.0.0", port=8000)
+
