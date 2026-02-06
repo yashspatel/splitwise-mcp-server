@@ -1,7 +1,9 @@
-fastmcp==2.14.4
+openai>=1.40.0
+fastmcp>=2.6.0
 python-dotenv>=1.0.0
-splitwise>=3.0.0
+
 
 
 #py-key-value-aio[redis]>=0.3.0
 #cryptography>=42.0.0
+
