@@ -1,13 +1,13 @@
 [project]
-name = "splitwise-mcp"
+name = "splitwise-mcp-local"
 version = "0.1.0"
-description = "Add your description here"
-readme = "README.md"
+description = "Local Splitwise MCP server (FastMCP) with preview-confirm safety."
 requires-python = ">=3.11"
 dependencies = [
-    "cryptography>=42.0.0",
-    "fastmcp==2.14.4",
-    "py-key-value-aio[redis]>=0.3.0",
-    "python-dotenv>=1.0.0",
-    "splitwise>=3.0.0",
+  "fastmcp>=2.2.11",
+  "splitwise>=3.0.0",
+  "python-dotenv>=1.0.0",
 ]
+
+[tool.uv]
+dev-dependencies = []
