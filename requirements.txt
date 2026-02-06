@@ -1,9 +1,11 @@
-fastmcp>=2.6.0
+fastmcp>=2.2.11
 splitwise>=3.0.0
 python-dotenv>=1.0.0
 
 
+
 #py-key-value-aio[redis]>=0.3.0
 #cryptography>=42.0.0
+
 
 
