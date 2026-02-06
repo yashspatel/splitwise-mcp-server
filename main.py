@@ -1,4 +1,20 @@
+"""
+Splitwise MCP Server (Local-first)
+
+How users run it:
+- HTTP (default): uv run python main.py
+  -> serves at http://127.0.0.1:8000/mcp
+
+- STDIO (for desktop MCP clients): uv run python main.py --transport stdio
+
+Environment variables (set in .env):
+  SPLITWISE_CONSUMER_KEY=...
+  SPLITWISE_CONSUMER_SECRET=...
+  SPLITWISE_API_KEY=...   (user-specific)
+"""
+
 import os
+import argparse
 import asyncio
 import time
 import json
@@ -87,13 +103,14 @@ def _require_confirmation(action: str, token: Optional[str], payload: Dict[str, 
 
 
 # =============================================================================
-# Splitwise client (LOCAL MODE: per-user env vars)
+# Splitwise client (LOCAL MODE)
 # =============================================================================
 
 def _client() -> Splitwise:
     """
     Local mode:
     - Each user runs the server locally and sets their own keys in .env
+
     Required env:
       SPLITWISE_CONSUMER_KEY
       SPLITWISE_CONSUMER_SECRET
@@ -105,8 +122,7 @@ def _client() -> Splitwise:
 
     if not api_key:
         raise ValueError(
-            "Missing SPLITWISE_API_KEY in your environment. "
-            "Create a .env file and set SPLITWISE_API_KEY=..."
+            "Missing SPLITWISE_API_KEY. Create a .env file and set SPLITWISE_API_KEY=..."
         )
 
     return Splitwise(consumer_key, consumer_secret, api_key=api_key)
@@ -178,6 +194,7 @@ def _d2(x: Decimal) -> Decimal:
 
 @mcp.tool()
 async def splitwise_current_user() -> Dict[str, Any]:
+    """Return the authenticated user's Splitwise profile."""
     s = _client()
     u = await asyncio.to_thread(s.getCurrentUser)
     return _user_to_dict(u)
@@ -185,6 +202,7 @@ async def splitwise_current_user() -> Dict[str, Any]:
 
 @mcp.tool()
 async def splitwise_friends() -> List[Dict[str, Any]]:
+    """List friends with balances."""
     s = _client()
     friends = await asyncio.to_thread(s.getFriends)
 
@@ -207,6 +225,7 @@ async def splitwise_friends() -> List[Dict[str, Any]]:
 
 @mcp.tool()
 async def splitwise_groups() -> List[Dict[str, Any]]:
+    """List groups."""
     s = _client()
     groups = await asyncio.to_thread(s.getGroups)
     return [{"id": g.getId(), "name": g.getName()} for g in groups]
@@ -220,6 +239,7 @@ async def splitwise_expenses(
     dated_after: Optional[str] = None,
     dated_before: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
+    """Fetch expenses (light projection)."""
     s = _client()
 
     def _fetch():
@@ -246,7 +266,7 @@ async def splitwise_expenses(
 
 
 # =============================================================================
-# CREATE TOOL (preview + confirm token)
+# SINGLE CREATE TOOL (shares-based) — preview+token, then commit+token
 # =============================================================================
 
 @mcp.tool()
@@ -268,11 +288,17 @@ async def splitwise_create_expense_shares(
     request_id: Optional[str] = None,
     force_create: bool = False,
 ) -> Dict[str, Any]:
+    """
+    Create ONE Splitwise expense using shares.
+
+    Safety:
+    - If confirm=False: returns preview + confirmation_token; does NOT write.
+    - If confirm=True: requires confirmation_token from a prior preview for same payload.
+    """
     if cost <= 0:
         raise ValueError("cost must be > 0")
 
     total_cost = _d2(Decimal(str(cost)))
-
     s = _client()
     me, friends, groups = await _get_me_friends_groups(s)
 
@@ -280,6 +306,7 @@ async def splitwise_create_expense_shares(
     if not my_id:
         raise ValueError("Could not determine current user id.")
 
+    # Resolve group id by name if needed
     resolved_group_id = group_id
     if resolved_group_id is None and group_name:
         g = _find_group_by_name(groups, group_name)
@@ -288,6 +315,7 @@ async def splitwise_create_expense_shares(
             return {"ok": False, "errors": [f"Group not found: {group_name}", "Available: " + ", ".join(available)]}
         resolved_group_id = getattr(g, "getId", lambda: None)()
 
+    # Use group members for name -> id if group specified; else use friends
     members = friends
     if resolved_group_id is not None:
         members = await _get_group_members(s, int(resolved_group_id))
@@ -298,6 +326,7 @@ async def splitwise_create_expense_shares(
             return int(my_id)
         return _find_user_id_by_name(members, name) or _find_user_id_by_name(friends, name)
 
+    # Build split entries
     split_entries: List[Dict[str, Any]] = []
 
     if splits:
@@ -403,6 +432,7 @@ async def splitwise_create_expense_shares(
         for uid, owed in zip(ids, owed_list):
             split_entries.append({"id": uid, "owed_share": owed, "paid_share": None})
 
+    # Decide paid shares
     any_paid_provided = any(e["paid_share"] is not None for e in split_entries)
     if not any_paid_provided:
         payer_id = resolve_id(paid_by)
@@ -425,6 +455,7 @@ async def splitwise_create_expense_shares(
     for e in split_entries:
         e["paid_share"] = _d2(Decimal(str(e["paid_share"])))
 
+    # Validate sums and fix tiny drift
     owed_total = sum((e["owed_share"] for e in split_entries), Decimal("0"))
     owed_drift = total_cost - owed_total
     if owed_drift != Decimal("0") and split_entries:
@@ -447,6 +478,7 @@ async def splitwise_create_expense_shares(
         ],
     }
 
+    # PREVIEW path
     if not confirm:
         token = _make_confirmation("create", preview_payload)
         return {
@@ -457,6 +489,7 @@ async def splitwise_create_expense_shares(
             **preview_payload,
         }
 
+    # COMMIT path
     ok, err = _require_confirmation("create", confirmation_token, preview_payload)
     if not ok:
         token = _make_confirmation("create", preview_payload)
@@ -469,12 +502,14 @@ async def splitwise_create_expense_shares(
             **preview_payload,
         }
 
+    # De-dupe / idempotency
     _prune_cache()
     dedupe_key = f"rid:{request_id}" if request_id else f"sig:{_stable_hash(preview_payload)}"
     if (not force_create) and dedupe_key in _recent_creates:
         prev = _recent_creates[dedupe_key].response
         return {**prev, "deduped": True}
 
+    # Create expense
     expense = Expense()
     expense.setDescription(description)
     expense.setCost(f"{total_cost:.2f}")
@@ -516,7 +551,20 @@ async def splitwise_create_expense_shares(
 # Entrypoint
 # =============================================================================
 
+def _parse_args():
+    p = argparse.ArgumentParser()
+    p.add_argument("--transport", choices=["http", "stdio"], default=os.getenv("MCP_TRANSPORT", "http"))
+    p.add_argument("--host", default=os.getenv("MCP_HOST", "127.0.0.1"))
+    p.add_argument("--port", type=int, default=int(os.getenv("MCP_PORT", "8000")))
+    return p.parse_args()
+
+
 if __name__ == "__main__":
-    # Local MCP server
-    # URL becomes: http://127.0.0.1:8000/mcp
-    mcp.run(transport="http", host="127.0.0.1", port=8000)
+    args = _parse_args()
+
+    if args.transport == "stdio":
+        # For desktop MCP clients that prefer stdio
+        mcp.run(transport="stdio")
+    else:
+        # Default: local HTTP server at http://127.0.0.1:8000/mcp
+        mcp.run(transport="http", host=args.host, port=args.port)
