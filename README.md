@@ -1,7 +1,4 @@
-# Splitwise MCP Server (Local) — Step-by-step Setup (uv)
-
-This guide tells you exactly how to run this MCP server locally and connect it to your own client.
-
+# Splitwise MCP Server
 ---
 
 ## What you need
@@ -11,7 +8,7 @@ This guide tells you exactly how to run this MCP server locally and connect it t
 - Your Splitwise keys:
   - `SPLITWISE_CONSUMER_KEY`
   - `SPLITWISE_CONSUMER_SECRET`
-  - `SPLITWISE_API_KEY` (your personal Splitwise API key)
+  - `SPLITWISE_API_KEY`
 
 ---
 
@@ -37,8 +34,8 @@ Close and reopen your terminal after installation.
 ## 2) Clone this repo
 
 ```bash
-git clone <REPLACE_WITH_THIS_REPO_URL>
-cd <REPLACE_WITH_THIS_REPO_FOLDER>
+git clone https://github.com/yashspatel/splitwise-mcp-server.git
+cd splitwise-mcp-server
 ```
 
 ---
@@ -204,7 +201,7 @@ Try these:
 - `list my groups`
 - `list my friends`
 - `show my last 10 expenses`
-- `add an expense of 10 cad between me and honey equally split, i paid, for lunch`
+- `add an expense of 100 CAD between me and Abhishek, equally split, i paid, for lunch`
 
 ---
 
@@ -236,19 +233,3 @@ Fix:
 - First run in your client:
   - `list my friends`
   - then use the names exactly
-
----
-
-## Important notes
-
-- Do **NOT** commit your `.env` file to GitHub.
-- Keep `.env` private because it contains your personal API key.
-- Only commit `.env.example`.
-
----
-
-## Done ✅
-
-You are ready when:
-- Your server is running (`uv run python main.py` OR `--transport stdio`)
-- Your client config points to the correct URL or command
