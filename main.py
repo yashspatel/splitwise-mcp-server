@@ -9,7 +9,8 @@ from typing import Any, Dict, List, Optional, Tuple, NamedTuple
 
 from dotenv import load_dotenv
 from fastmcp import FastMCP
-from fastmcp.server.dependencies import CurrentHeaders  # ✅ NEW
+from fastmcp.dependencies import CurrentHeaders
+
 
 from splitwise import Splitwise
 from splitwise.expense import Expense
@@ -651,3 +652,4 @@ async def splitwise_add_comment(
 
 if __name__ == "__main__":
     mcp.run(transport="http", host="0.0.0.0", port=8000)
+
